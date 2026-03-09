@@ -16,6 +16,7 @@ import random
 import math
 
 from phase2.data_types import NodeTensor
+from phase2.agents.architect import infer_engine_from_category
 from config import MIN_NODE_COUNT, MAX_NODE_COUNT  # kept for compatibility (unused)
 from phase1.semantic_reasoner import SemanticReasoner
 
@@ -196,11 +197,25 @@ class NodeArchetypeGenerator:
             enhanced_context['image_motion'] = getattr(visual_palette, 'motion_words', [])
             enhanced_context['image_colors'] = getattr(visual_palette, 'primary_colors', [])
 
+        # Build divergence_values dict from divergence object for softmax temperature computation
+        divergence_values = {
+            'D_surface':   getattr(divergence, 'D_surface',   0.5),
+            'D_flow':      getattr(divergence, 'D_flow',      0.5),
+            'D_narrative': getattr(divergence, 'D_narrative', 0.5),
+        }
+        level_weights_dict = {
+            'surface':   getattr(creative_levels, 'surface',   0.333),
+            'flow':      getattr(creative_levels, 'flow',      0.333),
+            'narrative': getattr(creative_levels, 'narrative', 0.333),
+        }
+
         # Use extract_semantic_nodes to get BOTH category IDs AND keywords
         semantic_nodes = self.semantic_reasoner.extract_semantic_nodes(
             brand_essence,
             target_count,
-            enhanced_context  # Pass brand context + visual features
+            enhanced_context,       # brand context + visual features
+            level_weights_dict,
+            divergence_values,
         )
 
         # If semantic reasoner completely failed, use keyword-based fallback
@@ -221,17 +236,17 @@ class NodeArchetypeGenerator:
             if len(semantic_nodes) < 4 and "noise_generator" not in existing_ids:
                 semantic_nodes.append({"id": "noise_generator", "keywords": ["noise", "perlin", "texture"]})
 
-        # If still fewer than target, pad with generic fillers (capped at target_count)
+        # If still fewer than target, pad with utility nodes (not random generics)
+        # Only add nodes that make sense for any pipeline: color grading + compositing
         min_nodes = min(target_count, max(6, len(semantic_nodes) + 2))
-        filler_pool = [
-            {"id": "sdf_shape", "keywords": ["geometry", "shape", "sdf"]},       # <--- Added
-            {"id": "grid_pattern", "keywords": ["grid", "structure", "lines"]},   # <--- Added
-            {"id": "kaleidoscope", "keywords": ["mirror", "symmetry", "fractal"]},# <--- Added
-            {"id": "noise_generator", "keywords": ["noise", "texture"]},
-            {"id": "color_grade", "keywords": ["color", "grade"]},
-        ]
         existing_ids = set(n["id"] for n in semantic_nodes)
-        for filler in filler_pool:
+        utility_fillers = [
+            {"id": "color_grade", "keywords": ["color", "grade", "saturation"],
+             "description": f"Color grade and tone adjustment for: {brand_essence[:50]}"},
+            {"id": "noise_generator", "keywords": ["noise", "perlin", "texture"],
+             "description": f"Noise texture for organic variation in: {brand_essence[:50]}"},
+        ]
+        for filler in utility_fillers:
             if filler["id"] not in existing_ids and len(semantic_nodes) < min_nodes:
                 semantic_nodes.append(filler)
 
@@ -245,10 +260,26 @@ class NodeArchetypeGenerator:
             stable_id = f"n{idx}"
             used_ids.add(stable_id)
 
-            # Extract category and keywords from semantic node
+            # Extract category, keywords, and description from semantic node
             category = sem_node.get("id", "unknown")
             keywords = sem_node.get("keywords", [])
-            assigned_engine = sem_node.get("engine", "glsl").lower()
+            llm_engine = sem_node.get("engine", "").strip().lower()
+            # Normalize common aliases the LLM might produce
+            _aliases = {"p5.js": "p5", "p5js": "p5", "canvas2d": "p5",
+                        "three.js": "three_js", "threejs": "three_js"}
+            llm_engine = _aliases.get(llm_engine, llm_engine)
+            VALID_ENGINES = {"p5", "glsl", "three_js", "webaudio", "html_video"}
+            inferred_engine = infer_engine_from_category(category, keywords)
+            # Use LLM engine if valid, otherwise infer from category
+            if llm_engine in VALID_ENGINES:
+                assigned_engine = llm_engine
+            else:
+                assigned_engine = inferred_engine
+            # Override: if category implies drawing/shapes, prefer p5 over glsl
+            if assigned_engine == "glsl" and inferred_engine == "p5":
+                assigned_engine = "p5"
+            # Use LLM-generated description if available, otherwise fallback to generic
+            description = sem_node.get("description", "") or f"{category.replace('_', ' ')} node"
 
             # Parameters will be populated by Mason from generated code
             params = {}
@@ -258,7 +289,7 @@ class NodeArchetypeGenerator:
                 meta={
                     "category": category,
                     "label": category.replace("_", " ").title(),
-                    "description": f"{category.replace('_', ' ')} node",
+                    "description": description,
                     "creative_level": creative_level,
                     "engine_hint": assigned_engine,
                     "keywords": keywords,  # Store keywords in meta too

@@ -18,13 +18,27 @@ from config import CLIP_MODEL, VISUAL_MOOD_LABELS
 from data_types import ImageRef
 
 
+def _ensure_tensor(features):
+    """Extract tensor from CLIP output (handles both raw tensors and BaseModelOutputWithPooling)."""
+    if hasattr(features, 'pooler_output'):
+        return features.pooler_output
+    if hasattr(features, 'last_hidden_state'):
+        return features.last_hidden_state[:, 0]
+    return features
+
+
 class VisualClusterer:
     """Cluster images using CLIP and extract semantic properties"""
 
     def __init__(self):
         print("Loading CLIP for clustering...")
-        self.model = CLIPModel.from_pretrained(CLIP_MODEL)
-        self.processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
+        try:
+            self.model = CLIPModel.from_pretrained(CLIP_MODEL)
+            self.processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
+        except Exception as e:
+            print(f"  Online CLIP load failed ({e}), trying local cache...")
+            self.model = CLIPModel.from_pretrained(CLIP_MODEL, local_files_only=True)
+            self.processor = CLIPProcessor.from_pretrained(CLIP_MODEL, local_files_only=True)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
         self.mood_labels = VISUAL_MOOD_LABELS
@@ -170,7 +184,7 @@ class VisualClusterer:
         """Get CLIP embedding for image"""
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            features = self.model.get_image_features(**inputs)
+            features = _ensure_tensor(self.model.get_image_features(**inputs))
             features = features / features.norm(dim=-1, keepdim=True)
         return features.cpu().numpy().flatten()
 
@@ -181,8 +195,8 @@ class VisualClusterer:
             image_inputs = self.processor(images=image, return_tensors="pt").to(self.device)
 
             with torch.no_grad():
-                image_features = self.model.get_image_features(**image_inputs)
-                text_features = self.model.get_text_features(**text_inputs)
+                image_features = _ensure_tensor(self.model.get_image_features(**image_inputs))
+                text_features = _ensure_tensor(self.model.get_text_features(**text_inputs))
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
                 text_features = text_features / text_features.norm(dim=-1, keepdim=True)
                 sims = (image_features @ text_features.T).squeeze().cpu().numpy()

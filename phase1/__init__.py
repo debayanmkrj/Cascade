@@ -11,5 +11,5 @@ Components:
 - ui_generation.py: Guided entropy scaling for UI
 - semantic_reasoner.py: Semantic category extraction
 - image_search.py: Pexels API integration
-- design_assistant.py: Chat-based brief modification
 """
+# Note: design_assistant.py removed — replaced by phase2/design_copilot.py

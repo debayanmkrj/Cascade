@@ -21,33 +21,51 @@ STANDARD_UNIFORMS = {
     "u_input4", "u_input5", "u_input6", "u_input7",
 }
 
-# Sensible defaults for common parameter names
+# Sensible defaults for common parameter names.
+# Rule: if the param is used as mix(base, effect, u_param), default should be 0.5 (moderate).
+# If used as a multiplier where 1.0=identity, keep 1.0. If used as speed/scale keep natural.
 DEFAULT_VALUES = {
     # Motion/animation
     "speed": 0.5,
     "velocity": 0.5,
     "rate": 1.0,
+    "rotation": 0.5,
+    "ease": 0.05,      # easing factor — small value = smooth
 
     # Frequency/scale
     "frequency": 6.0,
     "freq": 6.0,
     "scale": 1.0,
     "zoom": 1.0,
+    "tile": 2.0,       # tiling count — 1.0 = single tile, 2+ = repeating
 
-    # Intensity/strength
+    # Intensity/strength — use 0.5 as "moderate effect", not 1.0 (which was identity for some uses)
     "amplitude": 0.5,
-    "intensity": 1.0,
-    "strength": 1.0,
-    "amount": 1.0,
+    "intensity": 0.5,
+    "strength": 0.5,
+    "amount": 0.5,
     "power": 1.0,
 
+    # Visual effects — use mix-based defaults (0.5 = half effect, visible)
+    "glow": 0.5,
+    "blur": 0.4,
+    "grade": 0.5,       # as mix weight: 0=no grade, 1=full grade
+    "tone": 0.5,        # as mix weight: 0=no tone, 1=full tone
+    "glitch": 0.0,      # off by default — dramatic when turned on
+    "distortion": 0.3,
+    "warp": 0.3,
+
     # Color adjustments
-    "brightness": 1.0,
-    "contrast": 1.0,
-    "saturation": 1.0,
+    "brightness": 0.0,  # as additive offset: 0=no change, +0.3=brighter
+    "contrast": 1.2,    # multiplicative: 1.0=no change, >1=more contrast
+    "saturation": 1.0,  # multiplier: 1.0=unchanged
     "hue_shift": 0.0,
     "hue": 0.0,
     "gamma": 1.0,
+    "exposure": 0.0,    # EV stops: 0=no change, 1=+1 stop brighter
+    "transparency": 1.0,
+    "opacity": 1.0,
+    "alpha": 1.0,
 
     # Thresholds/limits
     "threshold": 0.5,
@@ -70,8 +88,6 @@ DEFAULT_VALUES = {
     # Blending
     "mix": 0.5,
     "blend": 0.5,
-    "opacity": 1.0,
-    "alpha": 1.0,
 
     # Offsets
     "offset": 0.0,
@@ -88,6 +104,15 @@ DEFAULT_VALUES = {
     "lacunarity": 2.0,
     "persistence": 0.5,
     "gain": 0.5,
+    "perlin": 0.5,
+    "noise": 0.5,
+
+    # Composite/blend modes
+    "field": 0.3,       # field density — small default avoids overdraw
+    "bezier": 0.5,
+    "mirror": 0.0,      # off by default — binary toggle (0=off, 1=on)
+    "transform": 1.0,
+    "texture": 1.0,
 }
 
 

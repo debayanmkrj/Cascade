@@ -39,7 +39,7 @@ from data_types import RawInputBundle, ImageRef
 _phase1_pipeline = None
 _visual_clusterer = None
 _image_searcher = None
-_design_assistant = None
+_design_copilot = None
 _phase2_pipeline = None
 
 def get_phase1_pipeline():
@@ -66,13 +66,13 @@ def get_image_searcher():
         _image_searcher = ImageSearcher()
     return _image_searcher
 
-def get_design_assistant():
-    global _design_assistant
-    if _design_assistant is None:
-        print("[INIT] Loading Design Assistant...")
-        from phase1.design_assistant import DesignAssistant
-        _design_assistant = DesignAssistant()
-    return _design_assistant
+def get_design_copilot():
+    global _design_copilot
+    if _design_copilot is None:
+        print("[INIT] Loading Design Copilot...")
+        from phase2.design_copilot import DesignCopilot
+        _design_copilot = DesignCopilot()
+    return _design_copilot
 
 def get_phase2_pipeline():
     global _phase2_pipeline
@@ -99,6 +99,40 @@ app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024  # 32MB max
 sessions: Dict[str, Dict] = {}
 
 
+def _reconstruct_session_from_project(project: dict, session_id: str) -> dict:
+    """Synthesize a minimal session JSON from an existing output project.
+
+    Used when the original session file is no longer on disk but the frontend
+    still has the project JSON (e.g. loaded from outputs/).  Allows the copilot
+    and Phase 2 to operate on a loaded project without "Run Phase 1 first" errors.
+    """
+    brief = project.get("design_brief", {})
+    nodes = project.get("nodes", [])
+    archetypes = [
+        {
+            "id": n["id"],
+            "category": n.get("category", ""),
+            "role": n.get("role", "process"),
+            "engine": n.get("engine", "glsl"),
+        }
+        for n in nodes
+    ]
+    return {
+        "session_id": session_id,
+        "timestamp": datetime.now().isoformat(),
+        "input": {"prompt_text": brief.get("prompt_text", "")},
+        "brief": {
+            "visual_palette": brief.get("visual_palette", {}),
+            "node_archetypes": archetypes,
+        },
+        "phase2_context": {
+            "essence": brief.get("essence", brief.get("prompt_text", "")),
+            "node_archetypes": archetypes,
+            "visual_palette": brief.get("visual_palette", {}),
+        },
+    }
+
+
 # ============================================================================
 # ROUTES - Static Files
 # ============================================================================
@@ -106,7 +140,12 @@ sessions: Dict[str, Dict] = {}
 @app.route('/')
 def index():
     """Serve main application"""
-    return render_template('index.html')
+    try:
+        from phase2.agents.mason import PREDEFINED_CODE
+        predefined_codes = {k: v.get('code', '') for k, v in PREDEFINED_CODE.items()}
+    except Exception:
+        predefined_codes = {}
+    return render_template('index.html', predefined_codes=predefined_codes)
 
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
@@ -390,14 +429,17 @@ def _convert_brief_to_frontend(node_brief) -> Dict:
     if hasattr(node_brief, 'node_archetypes'):
         for arch in node_brief.node_archetypes:
             role = getattr(arch, 'role', 'process')
-            name = getattr(arch, 'name', getattr(arch, 'type', 'node'))
+            node_entry = {
+                'id': getattr(arch, 'id', getattr(arch, 'category', 'node')),
+                'engine': getattr(arch, 'engine', '')
+            }
 
             if role == 'input':
-                brief['pompelli']['node_workflow']['input_nodes'].append(name)
+                brief['pompelli']['node_workflow']['input_nodes'].append(node_entry)
             elif role == 'output':
-                brief['pompelli']['node_workflow']['output_nodes'].append(name)
+                brief['pompelli']['node_workflow']['output_nodes'].append(node_entry)
             else:
-                brief['pompelli']['node_workflow']['processing_nodes'].append(name)
+                brief['pompelli']['node_workflow']['processing_nodes'].append(node_entry)
 
     # Extract colors
     if hasattr(node_brief, 'visual_palette'):
@@ -456,82 +498,112 @@ def _generate_visualization(node_brief, images: List) -> Dict:
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """Chat with design assistant to modify brief"""
+    """Design Assistant Copilot — natural language pipeline control via llama3.2 tool-calling"""
     try:
         data = request.json
         message = data.get('message', '')
-        brief = data.get('brief', {})
+        session_id = data.get('session_id')
+        selected_node_id = data.get('selected_node_id')
+        project = data.get('project')  # current output JSON from frontend
 
         if not message:
             return jsonify({'success': False, 'error': 'No message provided'})
 
-        # Try programmatic modifications first
-        modified, response = _try_programmatic_modification(message, brief)
+        # Load session JSON from disk by matching session_id UUID
+        session_json = None
+        if session_id:
+            sessions_dir = Path(__file__).parent / 'sessions'
+            for f in sorted(sessions_dir.glob('*.json'), reverse=True):
+                try:
+                    sj = json.loads(f.read_text(encoding='utf-8'))
+                    if sj.get('session_id') == session_id:
+                        session_json = sj
+                        break
+                except Exception:
+                    pass
 
-        if modified:
-            return jsonify({
-                'success': True,
-                'response': response,
-                'brief': brief
-            })
+        # If session not on disk but project data is available — reconstruct and persist
+        # so Phase 2 can find it if update_visual_concept is later called.
+        if not session_json and session_id and project:
+            session_json = _reconstruct_session_from_project(project, session_id)
+            sessions_dir = Path(__file__).parent / 'sessions'
+            ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            reconstructed_path = sessions_dir / f"{ts}_session_{session_id[:8]}.json"
+            try:
+                reconstructed_path.write_text(
+                    json.dumps(session_json, indent=2), encoding='utf-8'
+                )
+                print(f"[chat] Reconstructed session from project → {reconstructed_path.name}")
+            except Exception as e:
+                print(f"[chat] Could not save reconstructed session: {e}")
 
-        # Fall back to LLM
-        assistant = get_design_assistant()
-        result = assistant.modify_brief(message, brief)
+        copilot = get_design_copilot()
+        result = copilot.process(message, session_json, project, selected_node_id)
+
+        # If session was modified and we know the file, save it back so Phase 2 picks it up
+        if session_json and result.get('session_json') and result.get('pipeline_needed'):
+            sessions_dir = Path(__file__).parent / 'sessions'
+            for f in sorted(sessions_dir.glob('*.json'), reverse=True):
+                try:
+                    sj = json.loads(f.read_text(encoding='utf-8'))
+                    if sj.get('session_id') == session_id:
+                        f.write_text(
+                            json.dumps(result['session_json'], indent=2),
+                            encoding='utf-8'
+                        )
+                        break
+                except Exception:
+                    pass
 
         return jsonify({
             'success': True,
-            'response': result.get('response', 'Brief updated.'),
-            'brief': result.get('brief', brief)
+            'response': result['response'],
+            'project': result.get('project'),
+            'pipeline_needed': result.get('pipeline_needed', False),
         })
     except Exception as e:
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)})
 
 
-def _try_programmatic_modification(message: str, brief: Dict) -> tuple:
-    """Try to handle common modifications programmatically"""
-    msg_lower = message.lower()
-    pompelli = brief.get('pompelli', {})
+@app.route('/api/save-project', methods=['POST'])
+def save_project():
+    """Save current project JSON — called after manual UI edits (position, param, delete).
 
-    # Add color
-    if 'add' in msg_lower and 'color' in msg_lower:
-        import re
-        hex_match = re.search(r'#[0-9a-fA-F]{6}', message)
-        if hex_match:
-            color = hex_match.group()
-            if 'visual_identity' not in pompelli:
-                pompelli['visual_identity'] = {}
-            if 'color_palette' not in pompelli['visual_identity']:
-                pompelli['visual_identity']['color_palette'] = []
-            pompelli['visual_identity']['color_palette'].append(color)
-            brief['pompelli'] = pompelli
-            return True, f"Added color {color} to palette."
+    Writes in-place to the same file on every call (no new timestamps).
+    The client passes back `output_path` from the previous save response so we know
+    which file to overwrite.  On the very first save the client passes null and we
+    derive a stable session-keyed filename: project_{sid8}.json.
+    """
+    try:
+        data = request.json
+        project = data.get('project')
+        session_id = data.get('session_id', 'manual')
+        output_path = data.get('output_path')  # path returned by a previous save
 
-    # Add node
-    if 'add' in msg_lower and 'node' in msg_lower:
-        import re
-        # Extract node name (text after "add" and "node")
-        match = re.search(r'add\s+(?:a\s+)?(\w+)\s+node', msg_lower)
-        if match:
-            node_name = match.group(1)
-            if 'node_workflow' not in pompelli:
-                pompelli['node_workflow'] = {'input_nodes': [], 'processing_nodes': [], 'output_nodes': []}
-            pompelli['node_workflow']['processing_nodes'].append(node_name)
-            brief['pompelli'] = pompelli
-            return True, f"Added {node_name} node to processing nodes."
+        if not project:
+            return jsonify({'success': False, 'error': 'No project provided'})
 
-    # Change project name
-    if 'name' in msg_lower and ('project' in msg_lower or 'call' in msg_lower):
-        import re
-        match = re.search(r'(?:name|call)\s+(?:it\s+)?["\']?([^"\']+)["\']?', msg_lower)
-        if match:
-            name = match.group(1).strip()
-            pompelli['project_name'] = name
-            brief['pompelli'] = pompelli
-            return True, f"Changed project name to '{name}'."
+        output_dir = Path(__file__).parent / 'outputs'
+        output_dir.mkdir(exist_ok=True)
 
-    return False, None
+        if output_path:
+            target = Path(output_path)
+            # Safety: must remain inside outputs/
+            try:
+                target.resolve().relative_to(output_dir.resolve())
+            except ValueError:
+                target = output_dir / target.name
+        else:
+            # First save: stable filename keyed to session (no timestamp)
+            sid_short = str(session_id)[:8] if session_id else 'manual'
+            target = output_dir / f"project_{sid_short}.json"
+
+        target.write_text(json.dumps(project, indent=2), encoding='utf-8')
+        return jsonify({'success': True, 'path': str(target)})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)})
 
 
 # ============================================================================
@@ -683,13 +755,25 @@ def phase2_execute():
         session_id = data.get('session_id', '')
         session_path = data.get('session_path', '')
 
-        # Try loading from file or from in-memory session
+        # Try loading from file, in-memory session, or disk scan by session_id
         session_json = None
         if session_path and Path(session_path).exists():
             with open(session_path, 'r') as f:
                 session_json = json.load(f)
-        elif session_id and session_id in sessions:
-            # Build session_json from in-memory session
+        elif session_id:
+            # 1. Check disk first (covers loaded output files whose session is on disk)
+            sessions_dir = Path(__file__).parent / 'sessions'
+            for f in sorted(sessions_dir.glob('*.json'), reverse=True):
+                try:
+                    sj = json.loads(f.read_text(encoding='utf-8'))
+                    if sj.get('session_id') == session_id:
+                        session_json = sj
+                        break
+                except Exception:
+                    pass
+
+        if not session_json and session_id and session_id in sessions:
+            # 2. Fall back to in-memory session (active pipeline run)
             sess = sessions[session_id]
             node_brief = sess.get('node_brief')
             if node_brief and hasattr(node_brief, 'to_dict'):
@@ -752,7 +836,7 @@ def list_sessions():
     """List available Phase 1 session files for Phase 2."""
     try:
         from config import SESSIONS_DIR
-        session_files = list(Path(SESSIONS_DIR).glob('session_*.json'))
+        session_files = list(Path(SESSIONS_DIR).glob('*_session_*.json')) + list(Path(SESSIONS_DIR).glob('session_*.json'))
         result = []
         for sf in sorted(session_files, reverse=True)[:20]:
             with open(sf, 'r') as f:

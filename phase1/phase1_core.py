@@ -287,7 +287,9 @@ class Phase1Pipeline:
             }
         }
 
-        session_path = Path(SESSIONS_DIR) / f"session_{session_id}.json"
+        dt_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        short_id = session_id[:8]
+        session_path = Path(SESSIONS_DIR) / f"{dt_str}_session_{short_id}.json"
         with open(session_path, 'w') as f:
             json.dump(session_data, f, indent=2, default=str)
 

@@ -55,6 +55,9 @@ class NodeTensor:
     output_texture: Optional[TextureHandle] = None
     # Semantic keywords from SemanticReasoner (for Mason tag matching)
     keywords: List[str] = field(default_factory=list)
+    # Semantic purpose: what this specific node should contribute to the brief
+    # Set by SemanticDecomposer — scoped validation target for Mason
+    semantic_purpose: str = ""
     # Validation state
     architect_approved: bool = False
     mason_approved: bool = False
@@ -98,6 +101,7 @@ class NodeTensor:
                 }
             ) if self.output_texture else None,
             'keywords': self.keywords,
+            'semantic_purpose': self.semantic_purpose,
             'architect_approved': self.architect_approved,
             'mason_approved': self.mason_approved,
             'validation_errors': self.validation_errors
@@ -166,3 +170,90 @@ class MasonResult:
     code_snippet: str
     syntax_valid: bool = False
     validation_log: List[str] = field(default_factory=list)
+
+
+# ============================================================
+# Chain of Influence types
+# ============================================================
+
+ChannelProtocol = Literal[
+    "DENSITY_RGBA",   # R=density, G=age/trail, B=noise, A=mask
+    "COLOR_RGBA",     # RGB=color, A=alpha
+    "IMAGE_RGBA",     # Camera/image feed
+    "AUDIO_FFT",      # Frequency bin data
+    "LANDMARKS",      # Tracking keypoints
+    "DATA_JSON",      # Structured events/control
+]
+
+InfluenceType = Literal[
+    "mask_and_emit",
+    "warp_only",
+    "color_grade",
+    "composite",
+    "feedback_trails",
+    "data_drive",
+]
+
+
+@dataclass
+class InfluenceContract:
+    """What one node must do with another node's output."""
+    influence_type: str  # InfluenceType
+    must_use: List[str] = field(default_factory=list)
+    preserve: List[str] = field(default_factory=list)
+    allow: List[str] = field(default_factory=list)
+    avoid: List[str] = field(default_factory=list)
+
+
+@dataclass
+class InfluenceEdge:
+    """Typed edge in the Influence Graph IR."""
+    from_node: str
+    to_node: str
+    protocol: str  # ChannelProtocol
+    influence: InfluenceContract
+
+    def to_legacy_connection(self, input_index: int = 0) -> Connection:
+        return Connection(from_node=self.from_node, from_output=0,
+                          to_node=self.to_node, to_input=input_index)
+
+
+@dataclass
+class InfluenceNode:
+    """Node in the Influence Graph IR."""
+    id: str
+    engine: str  # RuntimeEngine
+    role: str  # NodeRole
+    intent: str
+    output_protocol: str  # ChannelProtocol
+    category: str = ""
+    keywords: List[str] = field(default_factory=list)
+    suggested_params: List[str] = field(default_factory=list)
+    style_anchor: Dict[str, Any] = field(default_factory=dict)
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class InfluenceGraphIR:
+    """Complete Influence Graph intermediate representation."""
+    global_context: Dict[str, Any]
+    nodes: List[InfluenceNode] = field(default_factory=list)
+    edges: List[InfluenceEdge] = field(default_factory=list)
+    reasoning: str = ""
+
+
+@dataclass
+class BuildSheet:
+    """Per-node instruction sheet for Mason — the local contract."""
+    node_id: str
+    engine: str
+    intent: str
+    inputs: List[Dict[str, Any]] = field(default_factory=list)
+    influence_rules: Dict[str, List[str]] = field(default_factory=dict)
+    output_protocol: str = "COLOR_RGBA"
+    style_anchor: Dict[str, Any] = field(default_factory=dict)
+    params: List[str] = field(default_factory=list)
+    # Z-axis semantic context
+    grid_position: Tuple[int, int, int] = (0, 0, 0)
+    z_total: int = 1
+    z_role: str = ""  # "source", "processor", "compositor", "output"

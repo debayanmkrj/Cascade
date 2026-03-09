@@ -3,7 +3,36 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LowKCDR - Volumetric Grid Editor</title>
+    <title>Cascade - Volumetric Grid Editor</title>
+    <script>
+    // Intercept ml5 the instant its script assigns it to window.ml5.
+    // ml5 v1.x bundles TF.js internally and exposes it as ml5.tf — it does NOT
+    // assign to window.tf, so a window.tf interceptor never fires.
+    // Here we intercept window.ml5 instead and force the CPU backend via ml5.tf.
+    (function() {
+        var _ml5 = undefined;
+        Object.defineProperty(window, 'ml5', {
+            configurable: true,
+            get: function() { return _ml5; },
+            set: function(val) {
+                _ml5 = val;
+                // Redefine as plain writable so future ml5.* assignments work normally
+                Object.defineProperty(window, 'ml5', { value: val, writable: true, configurable: true });
+                // ml5 v1 exposes its bundled TF.js as ml5.tf
+                var tfRef = (val && val.tf) || window.tf;
+                if (tfRef && typeof tfRef.setBackend === 'function') {
+                    try {
+                        var p = tfRef.setBackend('cpu');
+                        if (p && typeof p.then === 'function') p.catch(function(){});
+                        console.log('[ML5 guard] Forced TensorFlow.js to CPU backend via ml5.tf.');
+                    } catch(e) { console.warn('[ML5 guard] setBackend failed:', e); }
+                } else {
+                    console.warn('[ML5 guard] ml5.tf not found — TF.js backend NOT forced to CPU.');
+                }
+            }
+        });
+    })();
+    </script>
     <style>
         :root { --bg:#050816; --bg-card:#0b1020; --bg-surface:#111827; --border:rgba(148,163,184,0.15); --accent:#22c55e; --accent-dim:#16a34a; --text:#e5e7eb; --text-soft:#9ca3af; --text-muted:#6b7280; --visceral:#f97316; --behavioral:#38bdf8; --reflective:#a855f7; }
         * { margin:0; padding:0; box-sizing:border-box; }
@@ -68,7 +97,7 @@
 
         /* Grid View (default) */
         #gridViewTab { position:relative; }
-        #previewCanvas { position:absolute; top:0; left:0; width:100%; height:100%; background:#000; z-index:0; }
+        #previewCanvas { position:absolute; top:0; left:0; width:100%; height:100%; background:#000; z-index:0; object-fit:contain; image-rendering:pixelated; }
         .grid-overlay { position:absolute; top:0; left:0; width:100%; height:100%; z-index:1; overflow:auto; padding:12px; }
         .grid-overlay::-webkit-scrollbar { width:6px; }
         .grid-overlay::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
@@ -95,10 +124,15 @@
         .z-nodes.drag-over { background:rgba(34,197,94,0.15); outline:2px dashed var(--accent); outline-offset:-2px; }
         .z-layer.drag-highlight .z-layer-header { background:rgba(34,197,94,0.2); }
 
+        /* Connection lines SVG overlay */
+        #connectionSvg { position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:2; }
+        .connection-line { fill:none; stroke:rgba(100,200,255,0.25); stroke-width:1.5; }
+        .connection-line.highlight { stroke:rgba(100,200,255,0.8); stroke-width:2.5; }
+
         /* Pipeline View */
         #pipelineViewTab { flex-direction:column; }
-        .pipeline-top { flex:1; overflow:auto; padding:10px; border-bottom:1px solid var(--border); }
-        .pipeline-bottom { flex:1; overflow:auto; padding:10px; }
+        .pipeline-top { flex:1; min-height:0; overflow:auto; padding:10px; border-bottom:1px solid var(--border); }
+        .pipeline-bottom { flex:1; min-height:0; overflow:auto; padding:10px; }
         .image-grid-large { display:grid; grid-template-columns:repeat(auto-fill, minmax(100px,1fr)); gap:6px; }
         .image-grid-large .image-item { aspect-ratio:1; border-radius:6px; overflow:hidden; border:2px solid var(--border); cursor:pointer; }
         .image-grid-large .image-item img { width:100%; height:100%; object-fit:cover; }
@@ -162,7 +196,7 @@
 
     <div class="container">
         <header class="header">
-            <div class="logo">Low-K-cdR</div>
+            <div class="logo">Cascade</div>
             <span style="color:var(--text-soft);font-size:10px;">Visual coding with Vibes</span>
             <div class="header-status">
                 <span style="font-size:9px;color:var(--text-soft);">Ollama:</span>
@@ -173,7 +207,11 @@
 
         <!-- Left Panel: Phase 1 Input -->
         <aside class="panel">
-            <div style="margin-bottom:8px;"><div class="title">Design Input</div><div class="subtitle">Phase 1 Controls</div></div>
+            <div style="margin-bottom:8px;display:flex;align-items:flex-start;justify-content:space-between;">
+                <div><div class="title">Design Input</div><div class="subtitle">Phase 1 Controls</div></div>
+                <button class="btn btn-sm btn-secondary" onclick="loadOutputFile()" title="Load a previously exported output JSON to resume a project" style="margin-top:2px;font-size:9px;">Load Output</button>
+                <input type="file" id="outputFileInput" accept=".json" style="display:none;" onchange="if(this.files[0])handleOutputFile(this.files[0])">
+            </div>
 
             <div class="section">
                 <div class="section-title">Prompt</div>
@@ -208,10 +246,6 @@
                         <option value="flow">Flow</option>
                     </select>
                 </div>
-                <div class="slider-container">
-                    <div class="slider-header"><span class="slider-label">LLM Seed</span><span class="slider-value" id="seedValue">42</span></div>
-                    <input type="range" id="seedSlider" min="1" max="100" value="42" oninput="document.getElementById('seedValue').textContent=this.value">
-                </div>
                 <button class="btn" style="width:100%;" onclick="generateBrief()" id="generateBtn">Generate Brief</button>
 
                 <!-- Pre-defined Nodes Palette (visible after pipeline populated) -->
@@ -219,7 +253,8 @@
                     <div style="font-size:9px;color:var(--text-soft);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:6px;">Add Pre-defined Node (Task 4)</div>
                     <div style="display:flex;flex-wrap:wrap;gap:4px;">
                         <button class="predef-node-btn" onclick="addPredefinedNode('video_input')" title="4a: Video/Image/Audio input (webcam, file, URL)">📹 Input</button>
-                        <button class="predef-node-btn" onclick="addPredefinedNode('p5_tracking')" title="4b: P5.js tracking (face, hands, body)">🎯 Tracking</button>
+                        <button class="predef-node-btn" onclick="addPredefinedNode('audio_input')" title="Audio input (microphone FFT for audio-reactive visuals)">🎵 Audio</button>
+                        <button class="predef-node-btn" onclick="addPredefinedNode('p5_tracking')" title="4b: ml5.js tracking (face, hands, body)">🎯 Tracking</button>
                         <button class="predef-node-btn" onclick="addPredefinedNode('color_node')" title="4c: Color with HUE picker (exposure, saturation, brightness)">🎨 Color</button>
                         <button class="predef-node-btn" onclick="addPredefinedNode('noise_generator')" title="4d: Noise generator (perlin, simplex, worley, fbm)">🌊 Noise</button>
                         <button class="predef-node-btn" onclick="addPredefinedNode('blend_node')" title="4e: Blend for Z-layer blending with blend mode dropdown">🔀 Blend</button>
@@ -241,6 +276,7 @@
             <div class="tab-content" id="gridViewTab">
                 <canvas id="previewCanvas"></canvas>
                 <div class="grid-overlay" id="gridOverlay">
+                    <svg id="connectionSvg"></svg>
                     <div id="gridContent"><div class="loading">Generate a brief to populate the grid</div></div>
                 </div>
             </div>
@@ -311,7 +347,7 @@
         // Global state
         let selectedImages = [], clusterData = null, currentBrief = null;
         let allSearchImages = [], highlightedCluster = null;
-        let currentSessionId = null, currentProject = null;
+        let currentSessionId = null, currentProject = null, currentOutputPath = null;
         let gridRuntime = null;
         let outputSyncActive = false; // sync grid canvas to output canvas
         let selectedNodeId = null;
@@ -319,7 +355,8 @@
         const ENGINE_COLORS = {
             'glsl': '#8b5cf6', 'three_js': '#3b82f6', 'webaudio': '#f97316',
             'html_video': '#ec4899', 'events': '#22c55e', 'regl': '#06b6d4',
-            'webgpu': '#eab308', 'python': '#64748b'
+            'webgpu': '#eab308', 'python': '#64748b',
+            'p5': '#0d9488', 'canvas2d': '#2563eb'
         };
         const Z_COLORS = ['#3b82f6','#8b5cf6','#f97316','#ec4899','#22c55e','#eab308','#06b6d4','#64748b'];
         const Z_ROLE_NAMES = { 0: 'Input', 1: 'Control' };
@@ -358,21 +395,52 @@
             }
         }
 
+        // Fixed render resolution — all engines (GLSL, p5, canvas2d, three_js) use this
+        // so that pixel coordinates in p5 code and UV coordinates in GLSL always refer
+        // to the same spatial grid. CSS scales the canvas up for display.
+        const RENDER_W = 512;
+        const RENDER_H = 512;
+
         function initRenderer() {
             const previewCanvas = document.getElementById('previewCanvas');
-            const container = previewCanvas.parentElement;
-            previewCanvas.width = container.clientWidth || 512;
-            previewCanvas.height = container.clientHeight || 400;
+            previewCanvas.width = RENDER_W;
+            previewCanvas.height = RENDER_H;
 
             if (typeof GridRuntime !== 'undefined') {
-                gridRuntime = new GridRuntime(previewCanvas);
+                try {
+                    gridRuntime = new GridRuntime(previewCanvas);
+
+                    // Patch currentProject in-memory and save to disk whenever a
+                    // hot-reload fix succeeds — closes the loop so fixed code persists.
+                    gridRuntime.onNodeFixed = (nodeId, fixedCode, fixedParams) => {
+                        if (!currentProject) return;
+                        const node = currentProject.nodes.find(n => n.id === nodeId);
+                        if (node) {
+                            node.code_snippet = fixedCode;
+                            if (fixedParams) node.parameters = { ...node.parameters, ...fixedParams };
+                            console.log(`[UI] Patched currentProject for ${nodeId} — scheduling save`);
+                            scheduleProjectSave();
+                        }
+                    };
+                } catch (e) {
+                    console.error('GridRuntime init failed:', e);
+                    const ctx = previewCanvas.getContext('2d');
+                    if (ctx) {
+                        ctx.fillStyle = '#0d0f1a';
+                        ctx.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
+                        ctx.fillStyle = '#f56565';
+                        ctx.font = '13px monospace';
+                        ctx.textAlign = 'center';
+                        ctx.fillText('WebGL2 not available', previewCanvas.width / 2, previewCanvas.height / 2 - 10);
+                        ctx.fillStyle = '#a0aec0';
+                        ctx.font = '11px monospace';
+                        ctx.fillText('Try Chrome or Firefox with hardware acceleration enabled', previewCanvas.width / 2, previewCanvas.height / 2 + 12);
+                    }
+                }
             }
 
-            window.addEventListener('resize', () => {
-                previewCanvas.width = container.clientWidth || 512;
-                previewCanvas.height = container.clientHeight || 400;
-                if (gridRuntime && gridRuntime.hub) gridRuntime.resize(previewCanvas.width, previewCanvas.height);
-            });
+            // Canvas framebuffer is fixed at RENDER_W×RENDER_H — CSS handles display scaling.
+            // No resize listener needed; the canvas size never changes.
 
             // Continuous sync loop: copies grid canvas to output canvas when output tab active
             (function outputSyncLoop() {
@@ -396,9 +464,13 @@
             const src = gridRuntime.canvas;
             const dst = document.getElementById('outputCanvas');
             if (!dst || !src) return;
+            // Match resolution so drawImage is a 1:1 pixel copy, not a scaled blit
+            if (dst.width !== src.width || dst.height !== src.height) {
+                dst.width = src.width;
+                dst.height = src.height;
+            }
             const ctx = dst.getContext('2d');
-            if (!ctx) return;
-            ctx.drawImage(src, 0, 0, dst.width, dst.height);
+            if (ctx) ctx.drawImage(src, 0, 0);
         }
 
         // Tab switching
@@ -412,6 +484,19 @@
             outputSyncActive = (tabId === 'outputViewTab');
             if (tabId === 'outputViewTab') {
                 initOutputCanvas();
+            }
+
+            if (tabId === 'gridViewTab') {
+                // Only resize canvas to match container — callers handle loadProject themselves
+                const previewCanvas = document.getElementById('previewCanvas');
+                const container = previewCanvas.parentElement;
+                const w = container.clientWidth || 512;
+                const h = container.clientHeight || 400;
+                if (w > 0 && h > 0 && (previewCanvas.width !== w || previewCanvas.height !== h)) {
+                    previewCanvas.width = w;
+                    previewCanvas.height = h;
+                    if (gridRuntime && gridRuntime.hub) gridRuntime.resize(w, h);
+                }
             }
         }
 
@@ -572,8 +657,7 @@
                     body: JSON.stringify({
                         prompt: prompt,
                         images: selectedImages,
-                        tension_value: document.getElementById('dSlider').value / 100,
-                        llm_seed: parseInt(document.getElementById('seedSlider').value)
+                        tension_value: document.getElementById('dSlider').value / 100
                     })
                 });
 
@@ -599,6 +683,15 @@
             btn.textContent = 'Generate Brief';
         }
 
+        function nodeChip(n) {
+            const id    = typeof n === 'string' ? n : (n.id || 'node');
+            const eng   = typeof n === 'string' ? '' : (n.engine || '');
+            const color = ENGINE_COLORS[eng] || '#334155';
+            const label = id.replace(/_/g, ' ');
+            const badge = eng ? `<span style="font-size:7px;background:${color}22;color:${color};border:1px solid ${color}44;border-radius:3px;padding:0 3px;margin-left:4px;vertical-align:middle;">${eng}</span>` : '';
+            return `<span style="display:inline-flex;align-items:center;background:#0f172a;border:1px solid ${color};border-radius:5px;padding:3px 7px;font-size:9px;color:#e2e8f0;white-space:nowrap;">${label}${badge}</span>`;
+        }
+
         function displayBrief(brief) {
             const c = document.getElementById('briefContent');
             if (!brief) { c.innerHTML = '<div class="loading">No brief</div>'; return; }
@@ -608,17 +701,33 @@
                 const ess = typeof brief.essence === 'string' ? brief.essence : (brief.essence.statement || '');
                 html += `<div class="essence-box">${ess}</div>`;
             }
-            const p = brief.pompelli || brief || {};
+
+            const p  = brief.pompelli || brief || {};
             const wf = p.node_workflow || {};
-            html += '<div class="brief-section"><div class="brief-label">Node Workflow</div>';
-            ['input_nodes', 'processing_nodes', 'output_nodes'].forEach(k => {
-                const nodes = wf[k] || [];
-                if (nodes.length > 0) {
-                    html += `<div style="font-size:8px;color:var(--text-soft);margin-top:3px;">${k.replace(/_/g, ' ').toUpperCase()}</div>`;
-                    html += `<div class="pills">${nodes.map((n, i) => `<span class="pill">${n}<button class="pill-remove" onclick="removeNode('${k}',${i})">x</button></span>`).join('')}</div>`;
-                }
-            });
-            html += '</div>';
+
+            const sections = [
+                { key: 'input_nodes',      label: 'Sources' },
+                { key: 'processing_nodes', label: 'Processing' },
+                { key: 'output_nodes',     label: 'Output' },
+            ];
+            const hasNodes = sections.some(s => (wf[s.key] || []).length > 0);
+            if (hasNodes) {
+                html += `<div class="brief-section"><div class="brief-label">Node Pipeline</div>`;
+                html += `<div style="display:flex;flex-direction:column;gap:5px;margin-top:5px;">`;
+                sections.forEach((s, si) => {
+                    const nodes = wf[s.key] || [];
+                    if (!nodes.length) return;
+                    html += `<div>`;
+                    html += `<div style="font-size:7px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px;">${s.label}</div>`;
+                    html += `<div style="display:flex;flex-wrap:wrap;gap:4px;">${nodes.map(nodeChip).join('')}</div>`;
+                    html += `</div>`;
+                    const remaining = sections.slice(si + 1).some(r => (wf[r.key] || []).length > 0);
+                    if (remaining) {
+                        html += `<div style="text-align:center;color:var(--accent);font-size:11px;line-height:1;">↓</div>`;
+                    }
+                });
+                html += `</div></div>`;
+            }
 
             const cols = p.visual_identity && p.visual_identity.color_palette ? p.visual_identity.color_palette : [];
             if (cols.length > 0) {
@@ -640,8 +749,96 @@
             }
         }
 
+        // =========================================================================
+        // Load Output JSON (Issue 3c)
+        // =========================================================================
+
+        function loadOutputFile() {
+            document.getElementById('outputFileInput').click();
+        }
+
+        async function handleOutputFile(file) {
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                try {
+                    const outputJson = JSON.parse(e.target.result);
+
+                    // Repopulate Design Brief panel from embedded design_brief block
+                    const db = outputJson.design_brief;
+                    if (db) {
+                        const promptEl = document.getElementById('promptInput');
+                        if (promptEl && db.prompt_text) promptEl.value = db.prompt_text;
+
+                        const dSlider = document.getElementById('dSlider');
+                        const dValue = document.getElementById('dValue');
+                        if (dSlider && db.D_global != null) {
+                            dSlider.value = Math.round(db.D_global * 100);
+                            dValue.textContent = Number(db.D_global).toFixed(2);
+                        }
+
+                        const modeSelect = document.getElementById('modeSelect');
+                        if (modeSelect && db.user_mode) modeSelect.value = db.user_mode;
+
+                        // Build a brief object compatible with displayBrief()
+                        const palette = db.visual_palette || {};
+                        const colors = (palette.primary_colors || []).concat(palette.accent_colors || []);
+                        const archetypes = db.node_archetypes || [];
+                        const syntheticBrief = {
+                            essence: db.essence || '',
+                            pompelli: {
+                                node_workflow: {
+                                    input_nodes: archetypes.filter(n => n.category === 'input').map(n => n.id),
+                                    processing_nodes: archetypes.filter(n => n.category !== 'input' && n.category !== 'output').map(n => n.id),
+                                    output_nodes: archetypes.filter(n => n.category === 'output').map(n => n.id),
+                                },
+                                visual_identity: { color_palette: colors },
+                                design_principles: [],
+                            }
+                        };
+                        currentBrief = syntheticBrief;
+                        displayBrief(syntheticBrief);
+                    }
+
+                    // Restore session ID from embedded metadata so the copilot and Phase 2 can re-run
+                    const embeddedSessionId = (outputJson.phase2_meta || {}).session_id;
+                    if (embeddedSessionId && !currentSessionId) {
+                        currentSessionId = embeddedSessionId;
+                    }
+
+                    // Restore canonical output path so saves overwrite the original file
+                    const embeddedPath = (outputJson.phase2_meta || {}).output_path;
+                    if (embeddedPath) currentOutputPath = embeddedPath;
+
+                    // Load project into runtime and render grid
+                    currentProject = outputJson;
+                    renderGridView(outputJson);
+                    const predefPanel = document.getElementById('predefinedNodesPanel');
+                    if (predefPanel) predefPanel.style.display = 'block';
+
+                    // Switch tab FIRST so canvas gets correct dimensions before load
+                    switchTab('gridViewTab');
+
+                    if (gridRuntime) {
+                        gridRuntime.loadProject(outputJson).then(() => {
+                            gridRuntime.start();
+                        }).catch(e => console.warn('[handleOutputFile]', e));
+                    }
+
+                    addChat(`Loaded output: ${(outputJson.nodes || []).length} nodes${db ? ', Design Brief restored' : ''}`, 'assistant');
+                } catch (err) {
+                    addChat('Error loading output file: ' + err.message, 'assistant');
+                }
+            };
+            reader.readAsText(file);
+        }
+
         // Phase 2
         async function runPhase2() {
+            // Fallback: try to get session ID embedded in the loaded project
+            if (!currentSessionId && currentProject) {
+                currentSessionId = (currentProject.phase2_meta || {}).session_id || null;
+            }
             if (!currentSessionId) {
                 addChat('No session. Generate a brief first.', 'assistant');
                 return;
@@ -664,37 +861,55 @@
                 if (data.success && data.project) {
                     hideOverlay();
                     currentProject = data.project;
+                    if (data.output_path) currentOutputPath = data.output_path;
                     const meta = data.project.phase2_meta || {};
                     const nodes = data.project.nodes || [];
                     const conns = data.project.connections || [];
 
                     if (statusEl) statusEl.remove();
 
-                    document.getElementById('briefContent').insertAdjacentHTML('beforeend', `
+                    // Phase 1 summary from embedded design_brief
+                    const db = data.project.design_brief || {};
+                    const cl = db.creative_levels || {};
+                    const dv = db.divergence || {};
+                    const p1html = `
                         <div class="brief-section">
-                            <div class="brief-label">Phase 2 - Volumetric Grid</div>
-                            <div style="font-size:10px;color:var(--text);">
-                                Grid: ${(data.project.grid || []).join('x')} |
-                                Nodes: ${nodes.length} |
-                                Connections: ${conns.length}<br>
-                                Architect: ${meta.architect_valid ? 'PASS' : 'FAIL'} |
-                                Mason: ${meta.mason_pass_rate || '?'}
+                            <div class="brief-label">Phase 1 — Creative Profile</div>
+                            <div style="font-size:10px;color:var(--text);line-height:1.7;">
+                                Mode: <strong>${db.user_mode || '—'}</strong> &nbsp;|&nbsp;
+                                Divergence: <strong>${db.D_global != null ? Number(db.D_global).toFixed(2) : '—'}</strong><br>
+                                Weights &mdash;
+                                Surface: ${cl.surface != null ? Number(cl.surface).toFixed(2) : '—'} &nbsp;
+                                Flow: ${cl.flow != null ? Number(cl.flow).toFixed(2) : '—'} &nbsp;
+                                Narrative: ${cl.narrative != null ? Number(cl.narrative).toFixed(2) : '—'}<br>
+                                D<sub>surface</sub>: ${dv.D_surface != null ? Number(dv.D_surface).toFixed(2) : '—'} &nbsp;
+                                D<sub>flow</sub>: ${dv.D_flow != null ? Number(dv.D_flow).toFixed(2) : '—'} &nbsp;
+                                D<sub>narrative</sub>: ${dv.D_narrative != null ? Number(dv.D_narrative).toFixed(2) : '—'}
                             </div>
                         </div>
-                    `);
+                        <div class="brief-section">
+                            <div class="brief-label">Phase 2 — Volumetric Grid</div>
+                            <div style="font-size:10px;color:var(--text);">
+                                Grid: ${(data.project.grid || []).join('x')} &nbsp;|&nbsp;
+                                Nodes: ${nodes.length} &nbsp;|&nbsp;
+                                Connections: ${conns.length}<br>
+                                Mason: ${meta.mason_pass_rate || '?'}
+                            </div>
+                        </div>`;
+                    document.getElementById('briefContent').insertAdjacentHTML('beforeend', p1html);
 
                     // Populate grid view
                     populateGridView(data.project);
 
-                    // Start live preview
+                    // Switch to grid view FIRST so canvas gets correct dimensions before load
+                    switchTab('gridViewTab');
+
+                    // Start live preview (canvas is now correctly sized)
                     if (gridRuntime) {
                         gridRuntime.loadProject(data.project).then(() => {
                             gridRuntime.start();
                         }).catch(e => console.warn('[GridRuntime]', e));
                     }
-
-                    // Switch to grid view
-                    switchTab('gridViewTab');
 
                     // Show pre-defined nodes panel
                     document.getElementById('predefinedNodesPanel').style.display = 'block';
@@ -714,7 +929,7 @@
         }
 
         // Alias for backward compatibility
-        function renderGridView(project) { populateGridView(project); }
+        function renderGridView(project) { populateGridView(project); setTimeout(() => drawConnections(), 50); }
 
         // Grid View: volumetric node grid organized by Z-layer
         function populateGridView(project) {
@@ -783,6 +998,71 @@
             container.innerHTML = html;
         }
 
+        // Draw connection lines between connected nodes in the grid view
+        function drawConnections() {
+            const svg = document.getElementById('connectionSvg');
+            if (!svg || !currentProject) return;
+            svg.innerHTML = '';
+
+            const overlay = document.getElementById('gridOverlay');
+            if (!overlay) return;
+            const overlayRect = overlay.getBoundingClientRect();
+            const scrollTop = overlay.scrollTop;
+            const scrollLeft = overlay.scrollLeft;
+
+            // Build node card position map
+            const nodePositions = {};
+            document.querySelectorAll('.grid-node').forEach(card => {
+                const nodeId = card.dataset.nodeId;
+                if (!nodeId) return;
+                const rect = card.getBoundingClientRect();
+                nodePositions[nodeId] = {
+                    cx: rect.left - overlayRect.left + scrollLeft + rect.width / 2,
+                    top: rect.top - overlayRect.top + scrollTop,
+                    bottom: rect.top - overlayRect.top + scrollTop + rect.height
+                };
+            });
+
+            // Draw bezier curves only for manually-set connections (auto Z-layer wires are implicit)
+            const connections = (currentProject.connections || []).filter(c => c.manual);
+            for (const conn of connections) {
+                const fromId = conn.from_node || conn.from;
+                const toId = conn.to_node || conn.to;
+                const from = nodePositions[fromId];
+                const to = nodePositions[toId];
+                if (!from || !to) continue;
+
+                const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                const midY = (from.bottom + to.top) / 2;
+                const d = `M ${from.cx} ${from.bottom} C ${from.cx} ${midY}, ${to.cx} ${midY}, ${to.cx} ${to.top}`;
+                path.setAttribute('d', d);
+                path.setAttribute('class', 'connection-line');
+                path.dataset.from = fromId;
+                path.dataset.to = toId;
+                svg.appendChild(path);
+            }
+
+            // Update SVG viewBox to cover full scrollable area
+            const contentEl = document.getElementById('gridContent');
+            if (contentEl) {
+                const w = Math.max(overlay.scrollWidth, overlayRect.width);
+                const h = Math.max(overlay.scrollHeight, overlayRect.height);
+                svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+                svg.style.width = w + 'px';
+                svg.style.height = h + 'px';
+            }
+        }
+
+        function highlightConnections(nodeId) {
+            document.querySelectorAll('.connection-line').forEach(line => {
+                if (line.dataset.from === nodeId || line.dataset.to === nodeId) {
+                    line.classList.add('highlight');
+                } else {
+                    line.classList.remove('highlight');
+                }
+            });
+        }
+
         // Node selection → show details in right panel
         function selectGridNode(nodeId) {
             selectedNodeId = nodeId;
@@ -792,6 +1072,9 @@
             document.querySelectorAll('.grid-node').forEach(el => el.classList.remove('selected'));
             const el = document.querySelector(`.grid-node[data-node-id="${nodeId}"]`);
             if (el) el.classList.add('selected');
+
+            // Highlight connections for selected node
+            highlightConnections(nodeId);
 
             const panel = document.getElementById('nodeDetailPanel');
             const content = document.getElementById('nodeDetailContent');
@@ -815,6 +1098,7 @@
             html += `<div class="detail-row"><span class="detail-key">Grid Pos</span><span class="detail-val">${(node.grid_position||[]).join(', ')}</span></div>`;
             html += `<div class="detail-row"><span class="detail-key">Inputs</span><span class="detail-val">${(node.input_nodes||[]).length}</span></div>`;
 
+
             // Z-layer movement controls
             const currentZ = (node.grid_position && node.grid_position[2]) || 0;
             const maxZ = currentProject ? Math.max(...currentProject.nodes.map(n => (n.grid_position && n.grid_position[2]) || 0)) : 0;
@@ -823,6 +1107,9 @@
                 <button onclick="moveNodeZ('${node.id}',-1)" style="padding:2px 8px;font-size:10px;cursor:pointer;background:#1a1f36;border:1px solid var(--border);border-radius:3px;color:var(--text);" ${currentZ <= 0 ? 'disabled' : ''}>↑ Up</button>
                 <span style="font-size:10px;font-weight:600;color:var(--accent);">Z=${currentZ}</span>
                 <button onclick="moveNodeZ('${node.id}',1)" style="padding:2px 8px;font-size:10px;cursor:pointer;background:#1a1f36;border:1px solid var(--border);border-radius:3px;color:var(--text);">↓ Down</button>
+            </div>`;
+            html += `<div style="margin-top:6px;">
+                <button onclick="deleteNode('${node.id}')" style="padding:3px 10px;font-size:10px;cursor:pointer;background:#3a1520;border:1px solid #6b2030;border-radius:3px;color:#ff6b6b;">Delete Node</button>
             </div>`;
 
             const params = node.parameters || {};
@@ -889,6 +1176,19 @@
                                 onchange="updateNodeParam('${node.id}','${k}',this.value)">
                         </div>`;
                     }
+                    // File picker (local file -> object URL)
+                    else if (uiMeta.ui === 'file_picker') {
+                        // Derive correct source_type values for each engine type
+                        const _fileSrcType = node.engine === 'webaudio' ? "'audio_file'" : '1';
+                        const _urlSrcType  = node.engine === 'webaudio' ? "'audio_file'" : '2';
+                        html += `<div class="slider-container">
+                            <div class="slider-header"><span class="slider-label">${k.replace(/_/g, ' ')}</span></div>
+                            <input type="file" accept="video/*,image/*,audio/*" style="width:100%;font-size:10px;color:var(--text-soft);"
+                                onchange="if(this.files[0]){var u=(window.URL||window.webkitURL).createObjectURL(this.files[0]);updateNodeParam('${node.id}','${k}',u);updateNodeParam('${node.id}','source_type',${_fileSrcType});}">
+                            <input type="text" placeholder="or paste URL..." value="${v || ''}" style="width:100%;margin-top:4px;background:var(--bg-darker);border:1px solid var(--border);border-radius:4px;padding:4px 6px;color:var(--text);font-size:10px;"
+                                oninput="updateNodeParam('${node.id}','${k}',this.value);if(this.value)updateNodeParam('${node.id}','source_type',${_urlSrcType});">
+                        </div>`;
+                    }
                     // Dropdown (also handle 'select' ui type)
                     else if ((uiMeta.ui === 'dropdown' || uiMeta.ui === 'select') && uiMeta.options) {
                         const options = uiMeta.options;
@@ -940,6 +1240,11 @@
         }
 
         function updateNodeParam(nodeId, key, value) {
+            // Coerce numeric strings to actual numbers (fixes dropdown values
+            // which are always strings from HTML <select>.value)
+            if (typeof value === 'string' && value !== '' && !isNaN(value)) {
+                value = Number(value);
+            }
             // Update display with visual feedback
             const valEl = document.getElementById('pval_' + key);
             if (valEl) {
@@ -959,6 +1264,15 @@
             }
             // Update live runtime (real-time) — output canvas syncs via drawImage
             if (gridRuntime) gridRuntime.setParam(nodeId, key, value);
+            // Source-selection params: trigger executor reinit so new source takes effect
+            if (gridRuntime && (key === 'source_type' || key === 'src')) {
+                setTimeout(() => {
+                    const exec = gridRuntime.getExecutorForNode(nodeId);
+                    if (exec && typeof exec.reinitSource === 'function') exec.reinitSource();
+                }, 50);
+            }
+            // Auto-save (debounced — handles rapid slider drags)
+            scheduleProjectSave();
         }
 
         function updateColorParam(nodeId, groupName, rKey, gKey, bKey, hexColor) {
@@ -975,6 +1289,67 @@
             console.log(`[UI] Color ${groupName} updated: ${hexColor} -> R:${r.toFixed(2)} G:${g.toFixed(2)} B:${b.toFixed(2)}`);
         }
 
+        function snapToValidZ(nodeId) {
+            // Enforce role-based Z constraints after any move/add/delete.
+            // Sources snap to lowest Z, outputs snap to highest Z,
+            // processes snap away from Z=0 when sources exist there.
+            // SKIP snap for manually positioned nodes (user override).
+            if (!currentProject) return false;
+            const node = currentProject.nodes.find(n => n.id === nodeId);
+            if (!node || !node.grid_position) return false;
+            if (node.user_positioned) return false;  // User manually moved — respect override
+
+            const meta = node.meta || {};
+            const role = (meta.role || '').toLowerCase();
+            const category = (meta.category || '').toLowerCase();
+            const z = node.grid_position[2] || 0;
+
+            // Compute current Z bounds
+            const allZ = currentProject.nodes.map(n => (n.grid_position || [0,0,0])[2] || 0);
+            const minZ = Math.min(...allZ);
+            const maxZ = Math.max(...allZ);
+
+            // Detect source nodes
+            const isSource = role === 'input' || role === 'source' || meta.is_source ||
+                /noise|generator|input|sampler|oscillator|field|loader/.test(category);
+
+            // Detect output nodes
+            const isOutput = role === 'output' ||
+                /output|composite|final|render|display/.test(category);
+
+            // Source nodes must be at lowest Z
+            if (isSource && z !== minZ) {
+                node.grid_position[2] = minZ;
+                console.log(`[SNAP] Source ${nodeId} snapped to Z=${minZ}`);
+                return true;
+            }
+
+            // Output nodes must be at highest Z
+            if (isOutput && z !== maxZ) {
+                node.grid_position[2] = maxZ;
+                console.log(`[SNAP] Output ${nodeId} snapped to Z=${maxZ}`);
+                return true;
+            }
+
+            // Process nodes must not be at Z=minZ if sources exist there
+            if (!isSource && !isOutput && z === minZ) {
+                const sourcesAtMinZ = currentProject.nodes.some(n => {
+                    const r = ((n.meta || {}).role || '').toLowerCase();
+                    const c = ((n.meta || {}).category || '').toLowerCase();
+                    return (r === 'input' || r === 'source' || (n.meta || {}).is_source ||
+                            /noise|generator|input|sampler/.test(c)) &&
+                           ((n.grid_position || [0,0,0])[2] || 0) === minZ;
+                });
+                if (sourcesAtMinZ) {
+                    node.grid_position[2] = minZ + 1;
+                    console.log(`[SNAP] Process ${nodeId} snapped from Z=${minZ} to Z=${minZ + 1}`);
+                    return true;
+                }
+            }
+
+            return false; // no snap needed
+        }
+
         function moveNodeZ(nodeId, direction) {
             if (!currentProject) return;
 
@@ -985,11 +1360,12 @@
             const newZ = Math.max(0, oldZ + direction);
             if (oldZ === newZ) return;
 
-            // Update node position
+            // Update node position — mark as user-positioned to override auto-snap
             node.grid_position[2] = newZ;
+            node.user_positioned = true;
 
-            // Lego 1:1 snap: recompute ALL connections
-            autoUpdateConnections(nodeId, newZ);
+            // Lego snap: recompute ALL connections
+            autoUpdateConnections(nodeId, node.grid_position[2]);
 
             // Re-render grid view
             renderGridView(currentProject);
@@ -997,14 +1373,53 @@
             // Re-select the node to update details panel
             selectGridNode(nodeId);
 
-            // Reload runtime with new connections
-            if (gridRuntime) {
-                gridRuntime.loadProject(currentProject).then(() => {
-                    gridRuntime.start();
-                }).catch(e => console.warn('[GridRuntime] Reload after Z move:', e));
-            }
+            // Incremental update — no executor teardown/rebuild, no shader compilation.
+            if (gridRuntime) gridRuntime.refreshLayout(currentProject);
+            scheduleProjectSave();
 
             console.log(`[UI] Moved node ${nodeId} from Z=${oldZ} to Z=${newZ}`);
+        }
+
+        function deleteNode(nodeId) {
+            if (!currentProject) return;
+
+            const idx = currentProject.nodes.findIndex(n => n.id === nodeId);
+            if (idx === -1) return;
+
+            // Remove the node
+            currentProject.nodes.splice(idx, 1);
+
+            // Remove connections referencing this node
+            currentProject.connections = (currentProject.connections || []).filter(
+                c => c.from_node !== nodeId && c.to_node !== nodeId
+            );
+
+            // Clean input_nodes references on remaining nodes
+            for (const n of currentProject.nodes) {
+                if (n.input_nodes) {
+                    n.input_nodes = n.input_nodes.filter(id => id !== nodeId);
+                }
+            }
+
+            // Recompute all connections from Z-layer positions
+            autoUpdateConnections(null, null);
+
+            // Re-render grid
+            renderGridView(currentProject);
+
+            // Clear detail panel
+            const detailEl = document.getElementById('node-detail');
+            if (detailEl) detailEl.innerHTML = '<p style="color:var(--text-soft);text-align:center;margin-top:40px;">Select a node</p>';
+
+            // Stop this node's executor (stops webcam etc.) then sync layout.
+            if (gridRuntime) {
+                gridRuntime.removeNode(nodeId);
+                gridRuntime.refreshLayout(currentProject);
+            }
+            scheduleProjectSave();
+
+            console.log(`[UI] Deleted node ${nodeId}`);
+            addChat(`Deleted node ${nodeId}`, 'assistant');
         }
 
         // =========================================================================
@@ -1058,8 +1473,11 @@
             // Update node position
             node.grid_position[2] = targetZ;
 
+            // Snap to valid Z if role constraint violated
+            snapToValidZ(nodeId);
+
             // Auto-update connections based on Z-layer rules
-            autoUpdateConnections(nodeId, targetZ);
+            autoUpdateConnections(nodeId, node.grid_position[2]);
 
             // Re-render grid view
             renderGridView(currentProject);
@@ -1067,31 +1485,28 @@
             // Re-select the node to update details panel
             selectGridNode(nodeId);
 
-            // Notify runtime
-            if (gridRuntime && gridRuntime.project) {
-                // Hot-update runtime by reloading project
-                gridRuntime.loadProject(currentProject).then(() => {
-                    gridRuntime.start();
-                }).catch(e => console.warn('[GridRuntime] Reload after move:', e));
-            }
+            // Incremental update — no executor teardown/rebuild.
+            if (gridRuntime) gridRuntime.refreshLayout(currentProject);
+            scheduleProjectSave();
 
             console.log(`[UI] Dragged node ${nodeId} from Z=${oldZ} to Z=${targetZ}`);
             addChat(`Moved node ${nodeId} to Z-layer ${targetZ}`, 'assistant');
         }
 
         function autoUpdateConnections(movedNodeId, newZ) {
-            // Lego 1:1 snap — recompute ALL connections from scratch.
-            // Each node at Z>0 connects to exactly 1 nearest node at Z-1
-            // by (X,Y) Euclidean distance. Position IS the connection graph.
+            // Multi-input wiring: each node at Z>0 connects to up to
+            // MAX_INPUTS nearest nodes at the previous Z layer.
             if (!currentProject) return;
-
+            const MAX_INPUTS = 4;
             const nodes = currentProject.nodes || [];
 
             // Build position map: id -> [x, y, z]
             const posMap = {};
+            const engineMap = {};
             for (const n of nodes) {
                 const gp = n.grid_position || [0, 0, 0];
                 posMap[n.id] = [gp[0] || 0, gp[1] || 0, gp[2] || 0];
+                engineMap[n.id] = n.engine || '';
             }
 
             // Group by Z
@@ -1105,12 +1520,22 @@
             const sortedZ = Object.keys(byZ).map(Number).sort((a, b) => a - b);
             const minZ = sortedZ[0];
 
-            // Clear all connections
-            currentProject.connections = [];
+            // Preserve data_only connections (Output To wires) before clearing
+            const dataOnlyConns = (currentProject.connections || []).filter(c => c.data_only);
+            // Clear auto-wired connections, keep data_only
+            currentProject.connections = [...dataOnlyConns];
 
-            // Rewire every node
+            // Rewire: each node at Z>minZ connects to up to MAX_INPUTS nearest at prev Z
             for (const n of nodes) {
                 const [x, y, z] = posMap[n.id];
+
+                // Preserve manually-wired nodes — skip auto-wiring
+                if (n.manual_inputs) {
+                    for (const fromId of (n.input_nodes || [])) {
+                        currentProject.connections.push({ from_node: fromId, to_node: n.id, manual: true });
+                    }
+                    continue;
+                }
 
                 if (z === minZ) {
                     n.input_nodes = [];
@@ -1128,23 +1553,19 @@
                     continue;
                 }
 
-                // Find nearest node at prevZ by (X,Y) distance
-                const candidates = byZ[prevZ] || [];
-                let bestId = null;
-                let bestDist = Infinity;
-                for (const cId of candidates) {
+                // Find up to MAX_INPUTS nearest at prevZ by (X,Y) distance
+                // Exclude webaudio nodes — their R8 FFT texture pollutes visual inputs
+                const candidates = (byZ[prevZ] || []).filter(cId => engineMap[cId] !== 'webaudio');
+                const scored = candidates.map(cId => {
                     const [cx, cy] = posMap[cId];
-                    const dist = (x - cx) ** 2 + (y - cy) ** 2;
-                    if (dist < bestDist) {
-                        bestDist = dist;
-                        bestId = cId;
-                    }
-                }
+                    return { id: cId, dist: (x - cx) ** 2 + (y - cy) ** 2 };
+                }).sort((a, b) => a.dist - b.dist);
 
-                n.input_nodes = bestId ? [bestId] : [];
-                if (bestId) {
+                const inputs = scored.slice(0, MAX_INPUTS).map(s => s.id);
+                n.input_nodes = inputs;
+                for (const fromId of inputs) {
                     currentProject.connections.push({
-                        from_node: bestId,
+                        from_node: fromId,
                         to_node: n.id
                     });
                 }
@@ -1175,6 +1596,53 @@
             }
         }
 
+        function setNodeInput(toId, fromId) {
+            if (!currentProject) return;
+            const node = currentProject.nodes.find(n => n.id === toId);
+            if (!node) return;
+
+            // Remove all existing connections to this node
+            currentProject.connections = (currentProject.connections || []).filter(
+                c => c.to_node !== toId
+            );
+
+            if (fromId) {
+                // Add new manual connection
+                currentProject.connections.push({ from_node: fromId, to_node: toId, manual: true });
+                node.input_nodes = [fromId];
+                node.manual_inputs = true;
+            } else {
+                // Cleared — let auto-wire take over on next move
+                node.input_nodes = [];
+                node.manual_inputs = false;
+                // Run auto-wire now so node reconnects based on Z position
+                autoUpdateConnections(null, null);
+            }
+
+            renderGridView(currentProject);
+            if (gridRuntime) gridRuntime.refreshLayout(currentProject);
+            selectGridNode(toId);
+            scheduleProjectSave();
+        }
+
+        function setNodeOutput(fromId, toId) {
+            if (!currentProject) return;
+            // Remove any existing data_only connections FROM this node
+            currentProject.connections = (currentProject.connections || []).filter(
+                c => !(c.from_node === fromId && c.data_only)
+            );
+            if (toId) {
+                // Add data-only manual connection (does not affect texture routing)
+                currentProject.connections.push({ from_node: fromId, to_node: toId, manual: true, data_only: true });
+            }
+            renderGridView(currentProject);
+            selectGridNode(fromId);
+            scheduleProjectSave();
+        }
+
+        // Code snippets from mason.py PREDEFINED_CODE — injected at render time
+        const PREDEFINED_CODES = {{ predefined_codes | tojson | safe }};
+
         // Pre-defined node parameters
         // Task 4: Predefined node templates with full parameter specs and UI metadata
         const PREDEFINED_NODE_TEMPLATES = {
@@ -1185,33 +1653,56 @@
                 role: 'input',
                 is_source: true,
                 parameters: {
-                    source_type: 0,  // 0=webcam, 1=file, 2=url
+                    source_type: -1,  // -1=unselected, 0=webcam, 1=file, 2=url
+                    src: '',
                     flip_horizontal: 0,
                     playback_rate: 1.0
                 },
                 parameter_ui: {
-                    source_type: { type: 'dropdown', default: 0, options: [{label:'Webcam',value:0},{label:'File',value:1},{label:'URL',value:2}], ui: 'dropdown' },
+                    source_type: { type: 'dropdown', default: -1, options: [{label:'Select source...',value:-1},{label:'Webcam',value:0},{label:'File',value:1},{label:'URL',value:2}], ui: 'dropdown' },
+                    src: { type: 'string', default: '', ui: 'file_picker' },
                     flip_horizontal: { type: 'bool', default: false, ui: 'toggle' },
                     playback_rate: { type: 'float', default: 1.0, range: [0.1, 4.0], ui: 'slider' }
                 }
             },
-            // 4b: P5.js Tracking
+            // Audio Input
+            audio_input: {
+                engine: 'webaudio',
+                label: 'Audio Input',
+                role: 'input',
+                is_source: true,
+                parameters: {
+                    source_type: '',  // ''=unselected, 'microphone', 'audio_file', 'system'
+                    src: '',
+                    fft_size: 256,
+                    smoothing: 0.8,
+                    gain: 1.0
+                },
+                parameter_ui: {
+                    source_type: { type: 'dropdown', default: '', options: [{label:'Select source...',value:''},{label:'Microphone',value:'microphone'},{label:'Audio File',value:'audio_file'},{label:'System Audio',value:'system'}], ui: 'dropdown' },
+                    src: { type: 'string', default: '', ui: 'file_picker' },
+                    fft_size: { type: 'dropdown', default: 256, options: [{label:'64',value:64},{label:'128',value:128},{label:'256',value:256},{label:'512',value:512},{label:'1024',value:1024}], ui: 'dropdown' },
+                    smoothing: { type: 'float', default: 0.8, range: [0.0, 1.0], ui: 'slider' },
+                    gain: { type: 'float', default: 1.0, range: [0.0, 3.0], ui: 'slider' }
+                }
+            },
+            // 4b: ml5.js Tracking (face/hand/body)
             p5_tracking: {
-                engine: 'p5',
-                label: 'P5 Tracking',
+                engine: 'canvas2d',
+                label: 'Tracking',
                 role: 'process',
                 is_source: false,
                 parameters: {
                     tracking_type: 0,  // 0=face, 1=hand, 2=body
                     max_detections: 1,
-                    confidence_threshold: 0.5,
-                    draw_landmarks: 1,
-                    draw_skeleton: 1
+                    confidence_threshold: 0.3,
+                    draw_landmarks: true,
+                    draw_skeleton: true
                 },
                 parameter_ui: {
                     tracking_type: { type: 'dropdown', default: 0, options: [{label:'Face',value:0},{label:'Hand',value:1},{label:'Body',value:2}], ui: 'dropdown' },
-                    max_detections: { type: 'int', default: 1, range: [1, 10], ui: 'slider' },
-                    confidence_threshold: { type: 'float', default: 0.5, range: [0.0, 1.0], ui: 'slider' },
+                    max_detections: { type: 'int', default: 1, range: [1, 4], ui: 'slider' },
+                    confidence_threshold: { type: 'float', default: 0.3, range: [0.0, 1.0], ui: 'slider' },
                     draw_landmarks: { type: 'bool', default: true, ui: 'toggle' },
                     draw_skeleton: { type: 'bool', default: true, ui: 'toggle' }
                 }
@@ -1280,31 +1771,39 @@
                     opacity: { type: 'float', default: 1.0, range: [0.0, 1.0], ui: 'slider' }
                 }
             },
-            // 4f: Particle.js Node
+            // 4f: Particle System Node
             particle_node: {
-                engine: 'canvas2d',
+                engine: 'p5',
                 label: 'Particle Node',
                 role: 'input',
                 is_source: true,
                 parameters: {
                     count: 80,
+                    color: '#ffffff',
                     size: 3.0,
+                    size_random: true,
                     opacity: 0.5,
                     speed: 2.0,
-                    shape: 0,  // 0=circle, 1=edge, etc.
-                    links_enabled: 1,
+                    shape: 0,
+                    links_enabled: true,
                     link_distance: 150,
-                    hover_enabled: 1
+                    link_color: '#ffffff',
+                    link_opacity: 0.4,
+                    direction: 0
                 },
                 parameter_ui: {
                     count: { type: 'int', default: 80, range: [10, 500], ui: 'slider' },
+                    color: { type: 'color', default: '#ffffff', ui: 'color_picker' },
                     size: { type: 'float', default: 3.0, range: [1.0, 20.0], ui: 'slider' },
+                    size_random: { type: 'bool', default: true, ui: 'toggle' },
                     opacity: { type: 'float', default: 0.5, range: [0.0, 1.0], ui: 'slider' },
                     speed: { type: 'float', default: 2.0, range: [0.1, 10.0], ui: 'slider' },
                     shape: { type: 'dropdown', default: 0, options: [{label:'Circle',value:0},{label:'Edge',value:1},{label:'Triangle',value:2},{label:'Polygon',value:3},{label:'Star',value:4}], ui: 'dropdown' },
                     links_enabled: { type: 'bool', default: true, ui: 'toggle' },
                     link_distance: { type: 'float', default: 150, range: [50, 300], ui: 'slider' },
-                    hover_enabled: { type: 'bool', default: true, ui: 'toggle' }
+                    link_color: { type: 'color', default: '#ffffff', ui: 'color_picker' },
+                    link_opacity: { type: 'float', default: 0.4, range: [0.0, 1.0], ui: 'slider' },
+                    direction: { type: 'dropdown', default: 0, options: [{label:'None',value:0},{label:'Up',value:1},{label:'Down',value:2},{label:'Left',value:3},{label:'Right',value:4}], ui: 'dropdown' }
                 }
             }
         };
@@ -1333,14 +1832,33 @@
                 newId = `n${counter}`;
             }
 
-            // For non-source nodes, find the last node at the highest Z to connect as input
+            // Role-aware Z placement
+            let targetZ;
+            if (template.is_source) {
+                targetZ = 0;  // Sources at bottom
+            } else if (template.role === 'output') {
+                targetZ = maxZ + 1;  // Outputs at top
+            } else {
+                targetZ = maxZ;  // Processes at current top (before output)
+            }
+
+            // For non-source nodes, find nodes at the previous Z to connect as input
             let inputNodes = [];
             if (!template.is_source) {
-                const topNodes = currentProject.nodes
-                    .filter(n => (n.grid_position?.[2] || 0) === maxZ)
+                const prevZ = targetZ > 0 ? targetZ - 1 : 0;
+                const prevNodes = currentProject.nodes
+                    .filter(n => (n.grid_position?.[2] || 0) === prevZ)
                     .map(n => n.id);
-                if (topNodes.length > 0) {
-                    inputNodes = [topNodes[topNodes.length - 1]];
+                if (prevNodes.length > 0) {
+                    inputNodes = [prevNodes[prevNodes.length - 1]];
+                } else {
+                    // Fallback: connect to highest Z node
+                    const topNodes = currentProject.nodes
+                        .filter(n => (n.grid_position?.[2] || 0) === maxZ)
+                        .map(n => n.id);
+                    if (topNodes.length > 0) {
+                        inputNodes = [topNodes[topNodes.length - 1]];
+                    }
                 }
             }
 
@@ -1360,13 +1878,13 @@
                     parameter_ui: template.parameter_ui
                 },
                 parameters: { ...template.parameters },
-                grid_position: [currentProject.nodes.length % 4, 0, maxZ + 1],
+                grid_position: [currentProject.nodes.length % 4, 0, targetZ],
                 grid_size: [1, 1],
                 input_nodes: inputNodes,
                 enabled: true,
                 architect_approved: true,
                 mason_approved: true,  // Predefined = already validated
-                code_snippet: ''
+                code_snippet: (PREDEFINED_CODES && PREDEFINED_CODES[category]) || ''
             };
 
             // Add connection for non-source nodes
@@ -1414,9 +1932,14 @@
                         renderGridView(currentProject);
                         selectGridNode(newId);
 
-                        // Update runtime with new node
+                        // Add only this new node — don't tear down existing executors.
                         if (gridRuntime) {
-                            gridRuntime.loadProject(currentProject).then(() => gridRuntime.start());
+                            gridRuntime.refreshLayout(currentProject);
+                            gridRuntime.addNode(addData.node).then(() => {
+                                scheduleProjectSave();
+                            });
+                        } else {
+                            scheduleProjectSave();
                         }
 
                         addChat(`${template.label} added at Z=${addData.node.grid_position[2]}`, 'assistant');
@@ -1432,26 +1955,74 @@
             }
         }
 
-        // Chat
+        // ----------------------------------------------------------------
+        // Auto-save: debounced project JSON save after manual UI edits
+        // ----------------------------------------------------------------
+        let _saveProjectTimer = null;
+        function scheduleProjectSave() {
+            clearTimeout(_saveProjectTimer);
+            _saveProjectTimer = setTimeout(() => {
+                if (!currentProject) return;
+                fetch('/api/save-project', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        project: currentProject,
+                        session_id: currentSessionId,
+                        output_path: currentOutputPath   // write in-place if known
+                    })
+                })
+                .then(r => r.json())
+                .then(d => { if (d.path) currentOutputPath = d.path; })
+                .catch(e => console.warn('[auto-save]', e));
+            }, 1000);
+        }
+
+        // ----------------------------------------------------------------
+        // Design Assistant Copilot chat
+        // ----------------------------------------------------------------
         async function sendChat() {
             const input = document.getElementById('chatInput');
             const msg = input.value.trim();
             if (!msg) return;
             addChat(msg, 'user');
             input.value = '';
-            if (!currentBrief) { addChat('Generate a brief first.', 'assistant'); return; }
-            addChat('Processing...', 'assistant');
+            if (!currentSessionId && !currentProject) {
+                addChat('Generate a brief or load a project first.', 'assistant');
+                return;
+            }
+            addChat('Thinking...', 'assistant');
             try {
                 const res = await fetch('/api/chat', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({message: msg, brief: currentBrief})
+                    body: JSON.stringify({
+                        message: msg,
+                        session_id: currentSessionId,
+                        selected_node_id: selectedNodeId,
+                        project: currentProject
+                    })
                 });
                 const data = await res.json();
                 document.getElementById('chatMessages').lastChild.remove();
                 if (data.success) {
                     addChat(data.response, 'assistant');
-                    if (data.brief) { currentBrief = data.brief; displayBrief(currentBrief); }
+                    // If project was modified (new node, delete, palette, param change)
+                    if (data.project) {
+                        currentProject = data.project;
+                        renderGridView(currentProject);
+                        scheduleProjectSave();  // persist copilot changes to output file
+                        if (gridRuntime) {
+                            gridRuntime.loadProject(currentProject)
+                                .then(() => gridRuntime.start())
+                                .catch(e => console.warn('[chat] grid reload:', e));
+                        }
+                    }
+                    // If a pipeline re-run is needed (new node, concept change)
+                    if (data.pipeline_needed) {
+                        addChat('Running pipeline to generate code...', 'assistant');
+                        await runPhase2();
+                    }
                 } else {
                     addChat('Error: ' + data.error, 'assistant');
                 }
@@ -1483,7 +2054,7 @@
             const blob = new Blob([JSON.stringify(currentProject, null, 2)], {type: 'application/json'});
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
-            a.download = 'lowkcdr_project.json';
+            a.download = 'cascade_project.json';
             a.click();
         }
 

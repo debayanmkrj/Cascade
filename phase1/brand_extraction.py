@@ -12,8 +12,17 @@ import requests
 from io import BytesIO
 import os
 
-from config import CLIP_MODEL, EMOTION_LABELS, BRAND_ATTRIBUTE_LABELS, OLLAMA_URL, MODEL_NAME
+from config import CLIP_MODEL, EMOTION_LABELS, BRAND_ATTRIBUTE_LABELS, MODEL_NAME
 from data_types import BrandValues, ImageRef
+
+
+def _ensure_tensor(features):
+    """Extract tensor from CLIP output (handles both raw tensors and BaseModelOutputWithPooling)."""
+    if hasattr(features, 'pooler_output'):
+        return features.pooler_output
+    if hasattr(features, 'last_hidden_state'):
+        return features.last_hidden_state[:, 0]
+    return features
 
 
 class BrandExtractor:
@@ -21,8 +30,13 @@ class BrandExtractor:
 
     def __init__(self):
         print("Loading CLIP for brand extraction...")
-        self.model = CLIPModel.from_pretrained(CLIP_MODEL)
-        self.processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
+        try:
+            self.model = CLIPModel.from_pretrained(CLIP_MODEL)
+            self.processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
+        except Exception as e:
+            print(f"  Online CLIP load failed ({e}), trying local cache...")
+            self.model = CLIPModel.from_pretrained(CLIP_MODEL, local_files_only=True)
+            self.processor = CLIPProcessor.from_pretrained(CLIP_MODEL, local_files_only=True)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
 
@@ -132,8 +146,8 @@ class BrandExtractor:
             image_inputs = self.processor(images=image, return_tensors="pt").to(self.device)
 
             with torch.no_grad():
-                image_features = self.model.get_image_features(**image_inputs)
-                text_features = self.model.get_text_features(**text_inputs)
+                image_features = _ensure_tensor(self.model.get_image_features(**image_inputs))
+                text_features = _ensure_tensor(self.model.get_text_features(**text_inputs))
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
                 text_features = text_features / text_features.norm(dim=-1, keepdim=True)
                 similarities = (image_features @ text_features.T).squeeze().cpu().numpy()
@@ -166,25 +180,17 @@ Output format:
 JSON OUTPUT:"""
 
         try:
-            import requests
-            response = requests.post(
-                OLLAMA_URL,
-                json={'model': MODEL_NAME, 'prompt': extraction_prompt, 'stream': False, 'format': 'json'},
-                timeout=60
-            )
-            response.raise_for_status()  # Raise on HTTP errors
-            result = response.json().get('response', '{}')
-
             import re
             import json
+            from aider_llm import get_aider_llm
+            from config import USE_CLOUD_LLM, CLOUD_MODEL_REASONING
+            model = CLOUD_MODEL_REASONING if USE_CLOUD_LLM else MODEL_NAME
+            result = get_aider_llm().call(extraction_prompt, model)
+
             json_match = re.search(r'\{[^}]+\}', result, re.DOTALL)
             if json_match:
                 values = json.loads(json_match.group())
                 return {k: max(0.0, min(1.0, float(v))) for k, v in values.items() if k in BRAND_ATTRIBUTE_LABELS}
-        except requests.exceptions.Timeout:
-            print("LLM request timed out (60s)")
-        except requests.exceptions.RequestException as e:
-            print(f"Network error in text attribute extraction: {e}")
         except Exception as e:
             print(f"Text attribute extraction error: {e}")
 

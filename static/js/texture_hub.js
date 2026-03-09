@@ -12,8 +12,10 @@ class TextureHub {
     this.nodeTextures = new Map();
     this.layerComposites = new Map();
     this.nodeData = new Map();
+    this.nodeCanvases = new Map(); // For JSModuleExecutor canvas sharing
 
-    this.blitProgram = this._createBlitProgram();
+    this.blitProgram = this._createBlitProgram(false);
+    this.blitProgramFlipped = this._createBlitProgram(true);
   }
 
   setNodeData(nodeId, data) {
@@ -24,6 +26,14 @@ class TextureHub {
     return this.nodeData.get(nodeId) ?? null;
   }
 
+  setNodeCanvas(nodeId, canvas) {
+    this.nodeCanvases.set(nodeId, canvas);
+  }
+
+  getNodeCanvas(nodeId) {
+    return this.nodeCanvases.get(nodeId) ?? null;
+  }
+
   allocate(nodeId, zLayer, opts = {}) {
     const kind = opts.kind || 'render';
 
@@ -31,6 +41,16 @@ class TextureHub {
       const w = opts.width ?? 1;
       const h = opts.height ?? 1;
       return this.allocateDataTexture(nodeId, zLayer, w, h, opts);
+    }
+
+    // Free any existing GPU texture for this node before allocating a new one.
+    // Without this, re-allocating (e.g. fallback executor after a failed init) leaks
+    // the old WebGLTexture + WebGLFramebuffer permanently.
+    const existing = this.nodeTextures.get(nodeId);
+    if (existing) {
+      if (existing.framebuffer) this.gl.deleteFramebuffer(existing.framebuffer);
+      if (existing.texture) this.gl.deleteTexture(existing.texture);
+      this.nodeTextures.delete(nodeId);
     }
 
     const w = opts.width ?? this.width;
@@ -46,6 +66,7 @@ class TextureHub {
       texture, framebuffer, z_layer: zLayer, kind: 'render',
       width: w, height: h, internalFormat, format, type,
       visible: opts.visible ?? true,
+      flipY: opts.flipY ?? false,
     });
 
     return texture;
@@ -53,6 +74,15 @@ class TextureHub {
 
   allocateDataTexture(nodeId, zLayer, width, height, opts = {}) {
     const gl = this.gl;
+
+    // Free any existing GPU texture for this node before allocating a new one.
+    const existing = this.nodeTextures.get(nodeId);
+    if (existing) {
+      if (existing.framebuffer) gl.deleteFramebuffer(existing.framebuffer);
+      if (existing.texture) gl.deleteTexture(existing.texture);
+      this.nodeTextures.delete(nodeId);
+    }
+
     const internalFormat = opts.internalFormat ?? gl.R8;
     const format = opts.format ?? gl.RED;
     const type = opts.type ?? gl.UNSIGNED_BYTE;
@@ -124,7 +154,9 @@ class TextureHub {
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       for (const nodeEntry of nodesAtZ) {
-        this._blit(nodeEntry.texture);
+        // flipY=true for canvas-uploaded textures (canvas2d / js_module) which are
+        // uploaded without UNPACK_FLIP_Y_WEBGL — the blit shader compensates.
+        this._blit(nodeEntry.texture, nodeEntry.flipY === true);
       }
       gl.disable(gl.BLEND);
     }
@@ -211,14 +243,17 @@ class TextureHub {
     return fb;
   }
 
-  _createBlitProgram() {
+  _createBlitProgram(flipY = false) {
     const gl = this.gl;
     const vs = `#version 300 es
       in vec2 a_position; out vec2 v_uv;
       void main() { v_uv = a_position * 0.5 + 0.5; gl_Position = vec4(a_position, 0.0, 1.0); }`;
+    // flipY variant inverts v_uv.y so canvas-uploaded textures (top-left origin) render correctly
+    // without needing UNPACK_FLIP_Y_WEBGL (CPU copy) or createImageBitmap (async GPU pressure).
+    const uvY = flipY ? '1.0 - v_uv.y' : 'v_uv.y';
     const fs = `#version 300 es
       precision highp float; in vec2 v_uv; uniform sampler2D u_texture; out vec4 fragColor;
-      void main() { fragColor = texture(u_texture, v_uv); }`;
+      void main() { fragColor = texture(u_texture, vec2(v_uv.x, ${uvY})); }`;
 
     const program = this._createProgram(vs, fs);
     const vao = gl.createVertexArray();
@@ -234,9 +269,10 @@ class TextureHub {
     return { program, vao };
   }
 
-  _blit(texture) {
+  _blit(texture, flipY = false) {
     const gl = this.gl;
-    const { program, vao } = this.blitProgram;
+    const bp = flipY ? this.blitProgramFlipped : this.blitProgram;
+    const { program, vao } = bp;
     gl.useProgram(program);
     gl.bindVertexArray(vao);
     const loc = gl.getUniformLocation(program, 'u_texture');
@@ -281,47 +317,77 @@ class TextureHub {
 
   destroy() {
     const gl = this.gl;
+    const lost = gl.isContextLost();
     for (const entry of this.nodeTextures.values()) {
-      if (entry.framebuffer) gl.deleteFramebuffer(entry.framebuffer);
-      if (entry.texture) gl.deleteTexture(entry.texture);
+      if (!lost) {
+        if (entry.framebuffer) gl.deleteFramebuffer(entry.framebuffer);
+        if (entry.texture) gl.deleteTexture(entry.texture);
+      }
     }
     this.nodeTextures.clear();
     for (const entry of this.layerComposites.values()) {
-      if (entry.framebuffer) gl.deleteFramebuffer(entry.framebuffer);
-      if (entry.texture) gl.deleteTexture(entry.texture);
+      if (!lost) {
+        if (entry.framebuffer) gl.deleteFramebuffer(entry.framebuffer);
+        if (entry.texture) gl.deleteTexture(entry.texture);
+      }
     }
     this.layerComposites.clear();
     this.nodeData.clear();
     if (this.blitProgram) {
-      gl.deleteProgram(this.blitProgram.program);
-      gl.deleteVertexArray(this.blitProgram.vao);
+      if (!lost) {
+        gl.deleteProgram(this.blitProgram.program);
+        gl.deleteVertexArray(this.blitProgram.vao);
+      }
       this.blitProgram = null;
     }
+    if (this.blitProgramFlipped) {
+      if (!lost) {
+        gl.deleteProgram(this.blitProgramFlipped.program);
+        gl.deleteVertexArray(this.blitProgramFlipped.vao);
+      }
+      this.blitProgramFlipped = null;
+    }
   }
-  clearAll() {
-        // Delete all stored WebGL textures to free GPU memory
-        if (this.textures) {
-            for (const key in this.textures) {
-                if (this.textures[key]) {
-                    this.gl.deleteTexture(this.textures[key]);
-                }
-            }
-        }
-        
-        // Delete all framebuffers
-        if (this.framebuffers) {
-            for (const key in this.framebuffers) {
-                if (this.framebuffers[key]) {
-                    this.gl.deleteFramebuffer(this.framebuffers[key]);
-                }
-            }
-        }
+  dealloc(nodeId) {
+    const gl = this.gl;
+    const entry = this.nodeTextures.get(nodeId);
+    if (entry) {
+      if (!gl.isContextLost()) {
+        if (entry.framebuffer) gl.deleteFramebuffer(entry.framebuffer);
+        if (entry.texture) gl.deleteTexture(entry.texture);
+      }
+      this.nodeTextures.delete(nodeId);
+    }
+    this.nodeData.delete(nodeId);
+    this.nodeCanvases.delete(nodeId);
+  }
 
-        // Reset the dictionaries, but KEEP the compiled blit programs!
-        this.textures = {};
-        this.framebuffers = {};
-        
-        console.log("[TextureHub] Cleared textures and framebuffers (Shaders preserved).");
+  clearAll() {
+        const gl = this.gl;
+        const lost = gl.isContextLost();
+        // Delete all per-node textures and framebuffers
+        for (const entry of this.nodeTextures.values()) {
+            if (!lost) {
+                if (entry.framebuffer) gl.deleteFramebuffer(entry.framebuffer);
+                if (entry.texture) gl.deleteTexture(entry.texture);
+            }
+        }
+        this.nodeTextures.clear();
+
+        // Delete all Z-layer composite textures and framebuffers
+        for (const entry of this.layerComposites.values()) {
+            if (!lost) {
+                if (entry.framebuffer) gl.deleteFramebuffer(entry.framebuffer);
+                if (entry.texture) gl.deleteTexture(entry.texture);
+            }
+        }
+        this.layerComposites.clear();
+
+        // Clear node data but KEEP compiled blit programs
+        this.nodeData.clear();
+        this.nodeCanvases.clear();
+
+        console.log("[TextureHub] Cleared all node textures, layer composites, and node data.");
   } 
 }
 

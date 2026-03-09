@@ -17,6 +17,15 @@ from config import CLIP_MODEL
 from data_types import ImageRef, VisualPalette, BrandValues
 
 
+def _ensure_tensor(features):
+    """Extract tensor from CLIP output (handles both raw tensors and BaseModelOutputWithPooling)."""
+    if hasattr(features, 'pooler_output'):
+        return features.pooler_output
+    if hasattr(features, 'last_hidden_state'):
+        return features.last_hidden_state[:, 0]
+    return features
+
+
 class VisualPaletteGenerator:
     """Generate visual palette using CLIP embeddings for colors, shapes, and motion"""
 
@@ -28,8 +37,13 @@ class VisualPaletteGenerator:
             self.model.to(self.device)
         else:
             print("Loading CLIP for visual palette generation...")
-            self.model = CLIPModel.from_pretrained(CLIP_MODEL)
-            self.processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
+            try:
+                self.model = CLIPModel.from_pretrained(CLIP_MODEL)
+                self.processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
+            except Exception as e:
+                print(f"  Online CLIP load failed ({e}), trying local cache...")
+                self.model = CLIPModel.from_pretrained(CLIP_MODEL, local_files_only=True)
+                self.processor = CLIPProcessor.from_pretrained(CLIP_MODEL, local_files_only=True)
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
             self.model.to(self.device)
 
@@ -144,8 +158,8 @@ class VisualPaletteGenerator:
                 ).to(self.device)
 
                 with torch.no_grad():
-                    image_features = self.model.get_image_features(**image_inputs)
-                    text_features = self.model.get_text_features(**text_inputs)
+                    image_features = _ensure_tensor(self.model.get_image_features(**image_inputs))
+                    text_features = _ensure_tensor(self.model.get_text_features(**text_inputs))
                     image_features = image_features / image_features.norm(dim=-1, keepdim=True)
                     text_features = text_features / text_features.norm(dim=-1, keepdim=True)
                     similarities = (image_features @ text_features.T).squeeze().cpu().numpy()
@@ -262,8 +276,8 @@ class VisualPaletteGenerator:
                 image_inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
 
                 with torch.no_grad():
-                    image_features = self.model.get_image_features(**image_inputs)
-                    text_features = self.model.get_text_features(**text_inputs)
+                    image_features = _ensure_tensor(self.model.get_image_features(**image_inputs))
+                    text_features = _ensure_tensor(self.model.get_text_features(**text_inputs))
                     image_features = image_features / image_features.norm(dim=-1, keepdim=True)
                     text_features = text_features / text_features.norm(dim=-1, keepdim=True)
                     similarities = (image_features @ text_features.T).squeeze().cpu().numpy()
@@ -305,8 +319,8 @@ class VisualPaletteGenerator:
                 image_inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
 
                 with torch.no_grad():
-                    image_features = self.model.get_image_features(**image_inputs)
-                    text_features = self.model.get_text_features(**text_inputs)
+                    image_features = _ensure_tensor(self.model.get_image_features(**image_inputs))
+                    text_features = _ensure_tensor(self.model.get_text_features(**text_inputs))
                     image_features = image_features / image_features.norm(dim=-1, keepdim=True)
                     text_features = text_features / text_features.norm(dim=-1, keepdim=True)
                     similarities = (image_features @ text_features.T).squeeze().cpu().numpy()

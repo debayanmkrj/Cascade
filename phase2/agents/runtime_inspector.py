@@ -14,11 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import re
 import json
 import hashlib
-import requests
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 
-from config import OLLAMA_URL, MODEL_NAME_CODING
+from config import EFFECTIVE_MODEL_CODING
+from phase2.aider_llm import get_aider_llm
 
 
 class RuntimeInspector:
@@ -37,12 +37,13 @@ class RuntimeInspector:
       3. This prevents both blank screens and infinite loops
     """
 
-    MAX_RETRIES_PER_ERROR = 2
+    MAX_RETRIES_PER_ERROR = 5
     MAX_PASSTHROUGH_RETRIES = 1  # Extra retry attempt for passthrough nodes
 
     def __init__(self):
-        self.ollama_url = OLLAMA_URL
-        self.model = MODEL_NAME_CODING
+        self.llm = get_aider_llm()
+        self.model = EFFECTIVE_MODEL_CODING
+        print(f"[RuntimeInspector] Using model: {self.model}")
         self.error_attempts = {}   # {hash: count}
         self.passthrough_retries = {}  # {node_id: count} - track passthrough-specific retries
         self.fixed_errors = set()  # {hash}
@@ -54,8 +55,11 @@ class RuntimeInspector:
         self.fallback_node_callback = callback
 
     def _compute_error_hash(self, code: str, error_info: Dict[str, Any]) -> str:
-        """Create a fingerprint for this specific crash."""
-        fingerprint = f"{code[:50]}{error_info.get('message', '')}"
+        """Create a fingerprint scoped to the node + full code content."""
+        node_id = error_info.get('node_id', '')
+        err = error_info.get('message', '') or error_info.get('error_message', '')
+        # Use full code hash — preamble lines (import p5...) are identical across nodes
+        fingerprint = f"{node_id}{hashlib.md5(code.encode()).hexdigest()}{err[:60]}"
         return hashlib.md5(fingerprint.encode()).hexdigest()
 
     def fix_runtime_error(self, code: str, error_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -83,8 +87,27 @@ class RuntimeInspector:
             - If action == "fallback": caller should generate a semantic replacement node
         """
         node_id = error_info.get('node_id', 'unknown')
-        error_msg = error_info.get('message', error_info.get('error_message', 'Unknown'))
+        error_msg = error_info.get('message') or error_info.get('error_message') or 'Unknown error'
         engine = error_info.get('engine', 'glsl')
+
+        # WebGL2 drivers sometimes return null info log with no useful message.
+        # Substitute a diagnostic checklist so the LLM knows what to look for.
+        _null_patterns = ("null", "(gpu driver returned no error details", "shader compile failed:\nnull")
+        if engine in ("glsl", "regl") and any(error_msg.lower().strip().endswith(p) for p in _null_patterns):
+            error_msg = (
+                "WebGL2 rejected this shader with no error message (GPU driver returned null info log). "
+                "Audit the code for these common WebGL2/GLSL ES 3.00 issues:\n"
+                "- Scalar swizzle: accessing .r/.g/.b/.x/.y on a float variable (only valid on vec types)\n"
+                "- Function redeclaration: redefining hash(), noise(), fbm(), rgb2hsv(), etc. "
+                  "(these are already declared in the shader prefix — do NOT redeclare them)\n"
+                "- Array initializer syntax: float arr[] = {0.0, 1.0} is C syntax not GLSL; "
+                  "use float arr[2]; arr[0]=0.0; arr[1]=1.0;\n"
+                "- gl_FragColor instead of fragColor (WebGL2 requires fragColor out variable)\n"
+                "- texture2D() instead of texture() (WebGL2 uses texture())\n"
+                "- Struct or array initialization with braces {} — use constructors instead\n"
+                "Fix any of the above issues found in the code."
+            )
+            print(f"[RuntimeInspector] Null error log detected for {node_id} — using diagnostic prompt")
         is_passthrough = error_info.get('is_passthrough', False)
         category = error_info.get('category', 'unknown')
         keywords = error_info.get('keywords', [])
@@ -137,6 +160,8 @@ class RuntimeInspector:
 
         if attempts >= self.MAX_RETRIES_PER_ERROR:
             print(f"[RuntimeInspector] Gave up on error {error_hash[:8]} after {attempts} attempts")
+            # Mark as "fixed" so subsequent re-reports hit the fast skip path
+            self.fixed_errors.add(error_hash)
             return {
                 "action": "skip",
                 "error_msg": f"Max retries ({self.MAX_RETRIES_PER_ERROR}) exhausted for this error"
@@ -168,6 +193,12 @@ CODE:
 BROWSER ERROR:
 {error_msg}
 
+AVAILABLE GLSL FUNCTIONS (already defined in shader prefix — do NOT redefine):
+hash(float), hash(vec2), hash(vec3), hash2(vec2), hash3(vec2), hash3(vec3),
+noise(vec2), snoise(vec2), snoise(vec3), fbm(vec2),
+worley(vec2), simplex(vec2), simplex(vec3), perlin(vec2), perlin(vec3), voronoi(vec2)
+Do NOT use any noise functions outside this list. Do NOT redefine these.
+
 TASK:
 1. Analyze the error (look for precision issues, uninitialized varyings, loop limits, or driver bugs).
 2. Fix the code strictly. Do not change the visual look if possible.
@@ -177,8 +208,39 @@ TASK:
 
 Return ONLY the fixed GLSL code. No explanation, no markdown fences."""
         elif engine in ("three_js", "canvas2d", "events", "webaudio", "p5"):
-            prompt = f"""You are a JavaScript Runtime Debugger.
-The following {engine} code failed in the browser.
+            pixel_loop_rules = ""
+            if "pixel loop" in error_msg.lower() or "pixel-loop" in error_msg.lower():
+                pixel_loop_rules = """
+CRITICAL — PIXEL LOOP REMOVAL (this is why the code was rejected):
+The code contains nested for loops iterating over every pixel (for x<width; x++ inside for y<height; y++).
+This creates 262,144+ draw calls per frame and freezes the browser for 15+ seconds. YOU MUST REMOVE THEM.
+
+REPLACE pixel-filling loops with:
+  s.background(r, g, b);  // fills entire canvas in 1 call
+
+REPLACE per-pixel starfield/noise loops with:
+  // Pre-allocate in init — fixed count, NEVER inside s.draw()
+  const stars = Array.from({length: 300}, () => ({ x: Math.random()*width, y: Math.random()*height, r: Math.random()*2+0.5 }));
+  // In s.draw():
+  for (const star of stars) { s.ellipse(star.x, star.y, star.r); }  // 300 calls max
+
+RULES:
+- Total draw calls per s.draw() frame MUST be under 1000.
+- NO nested for loops where both bounds reference width or height with increment 1.
+- x += stride (where stride >= 4) is acceptable.
+- Starfields: pre-allocate array of ≤500 random positions ONCE in init, reuse every frame.
+"""
+
+            p5_rules = """
+P5.JS RULES:
+- inputs[0], inputs[1] etc. are raw HTMLCanvasElement objects.
+- NEVER call s.image(inputs[0], ...) — use s.drawingContext.drawImage(inputs[0], 0, 0, width, height).
+- Guard all input usage: if (inputs[0]) s.drawingContext.drawImage(inputs[0], 0, 0, width, height);
+- ALL p5 calls must use s. prefix (s.ellipse, s.fill, s.background, etc.)
+- NEVER push() to arrays inside s.draw() — pre-allocate at fixed size and update in-place.
+""" if engine == "p5" else ""
+
+            prompt = f"""You are a JavaScript Runtime Debugger. The following {engine} code failed in the browser.
 
 NODE: {node_id}
 PARAMETERS: {json.dumps(parameters, indent=2)}
@@ -190,45 +252,17 @@ CODE:
 
 BROWSER ERROR:
 {error_msg}
-
-Fix the code. Return ONLY the fixed code. No explanation.
-CRITICAL RULES:
-1. "array declared but never populated outside draw()" → Populate arrays immediately after declaration:
-   let arr = []; for (let i = 0; i < count; i++) arr.push({...});
-2. "nothing will render" → Verify your draw() function calls ctx.arc(), ctx.fill(), ctx.stroke(), etc.
-3. Use ctx for all drawing operations: ctx.beginPath(), ctx.arc(), ctx.fillStyle, ctx.fill()
-4. Test: Does your code have at least one ctx.arc() or ctx.fillRect() call?
-"""
+{pixel_loop_rules}{p5_rules}
+Fix the code. Return ONLY the complete fixed code. No explanation, no markdown fences."""
         else:
             return {
                 "action": "skip",
                 "error_msg": f"Unsupported engine: {engine}"
             }
 
-        # 3. Call LLM to attempt fix
+        # 3. Call LLM to attempt fix via AiderLLM (routes to cloud or local automatically)
         try:
-            response = requests.post(
-                self.ollama_url,
-                json={
-                    "model": self.model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.2,
-                        "num_predict": 4096,
-                    }
-                },
-                timeout=60
-            )
-
-            if response.status_code != 200:
-                print(f"[RuntimeInspector] LLM error: HTTP {response.status_code}")
-                return {
-                    "action": "skip",
-                    "error_msg": f"LLM HTTP error: {response.status_code}"
-                }
-
-            raw_text = response.json().get("response", "")
+            raw_text = self.llm.call(prompt, self.model)
             fixed_code = self._clean_code(raw_text, engine)
 
             # If LLM returns empty or garbage, abort
@@ -239,7 +273,8 @@ CRITICAL RULES:
                     "error_msg": f"LLM returned insufficient code ({len(fixed_code)} chars)"
                 }
 
-            self.fixed_errors.add(error_hash)
+            # Do NOT add to fixed_errors here — we don't know yet if the fix will pass
+            # hot-reload validation. Let error_attempts count handle the retry cap.
             self._record_fix(node_id, error_msg, error_hash)
             print(f"[RuntimeInspector] Fixed code for {node_id} ({len(fixed_code)} chars)")
             return {

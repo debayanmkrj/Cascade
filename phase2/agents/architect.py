@@ -13,15 +13,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import json
 import re
-import requests
 from typing import Dict, List, Tuple, Optional, Any
 
-from config import OLLAMA_URL, MODEL_NAME_REASONING
+from config import MODEL_NAME_REASONING
+from phase2.aider_llm import get_aider_llm
 from phase2.data_types import (
     NodeTensor, NodeMeta, TextureHandle, Connection,
     VolumetricGrid, ArchitectPlan
 )
-from phase2.agents.creative_topology import CreativeTopologyAgent
+try:
+    from phase2.agents.creative_topology import CreativeTopologyAgent
+except ImportError:
+    from phase2.agents._deprecated.creative_topology import CreativeTopologyAgent
+from phase2.agents.dag_layout import DAGLayout
 
 # Engine selection heuristics based on node category
 CATEGORY_ENGINE_MAP = {
@@ -134,14 +138,14 @@ CATEGORY_ENGINE_MAP = {
     "video_input": "html_video",
     "image_input": "html_video",
 
-    # --- Complex library effects → js_module (can import from CDN) ---
-    "tracking": "js_module",
-    "face_detection": "js_module",
-    "hand_tracking": "js_module",
-    "p5_tracking": "p5",
-    "face_tracking": "p5",
-    "body_tracking": "p5",
-    "pose_tracking": "p5",
+    # --- Tracking / detection → canvas2d (uses ml5.js via dynamic script load) ---
+    "tracking": "canvas2d",
+    "face_detection": "canvas2d",
+    "hand_tracking": "canvas2d",
+    "p5_tracking": "canvas2d",
+    "face_tracking": "canvas2d",
+    "body_tracking": "canvas2d",
+    "pose_tracking": "canvas2d",
 
     # --- Generic roles ---
     "generator": "canvas2d",
@@ -179,17 +183,21 @@ def infer_engine_from_category(category: str, keywords: List[str] = None) -> str
     if any(trigger in intent_string for trigger in threejs_triggers):
         return "three_js"
 
-    # 2. CANVAS 2D ROUTE (Generative Art, Shapes, Lines, Vectors, Flow)
-    canvas_triggers = [
-        "draw", "shape", "canvas", "flower", "tree", "mandala", 
-        "fractal", "2d", "line", "path", "vector", "petals", 
-        "organic_growth", "hud", "text", "polygon", "sketch", 
+    # 2. P5.JS ROUTE (Generative Art, Shapes, Lines, Vectors, Flow, Compositing)
+    p5_triggers = [
+        "draw", "shape", "canvas", "flower", "tree", "mandala",
+        "fractal", "2d", "line", "path", "vector", "petals",
+        "organic_growth", "hud", "text", "polygon", "sketch",
         "ui_", "typography", "circle", "rect", "triangle",
         "gradient", "star", "spiral", "grid_pattern", "flow",
-        "fluid", "organic", "flock", "boid", "swarm", "pattern"
+        "fluid", "organic", "flock", "boid", "swarm", "pattern",
+        "tracking", "face", "body", "pose", "hand",
+        "composite", "output", "layer", "blend", "combine",
+        "animation", "motion", "tween", "ease", "scale",
+        "petal", "leaf", "stem", "seed", "bloom"
     ]
-    if any(trigger in intent_string for trigger in canvas_triggers):
-        return "canvas2d"
+    if any(trigger in intent_string for trigger in p5_triggers):
+        return "p5"
 
     # 3. WEBAUDIO ROUTE
     audio_triggers = [
@@ -205,9 +213,9 @@ def infer_engine_from_category(category: str, keywords: List[str] = None) -> str
     if any(trigger in intent_string for trigger in video_triggers):
         return "html_video"
 
-    # 5. EVENTS ROUTE (Logic & Routing)
+    # 5. EVENTS ROUTE (Logic & Routing) — narrow triggers to avoid false positives
     event_triggers = [
-        "event", "control", "router", "logic", "trigger", "lfo", "param"
+        "event_router", "logic_gate", "lfo_oscillator", "param_router"
     ]
     if any(trigger in intent_string for trigger in event_triggers):
         return "events"
@@ -326,7 +334,13 @@ class ArchitectAgent:
         phase2_ctx = session_json.get('phase2_context', {})
         archetypes = phase2_ctx.get('node_archetypes', [])
         essence = phase2_ctx.get('essence', '')
-        brief = session_json.get('user_input', {}).get('brief', '')
+        brief = (
+            session_json.get('input', {}).get('prompt_text', '')
+            or session_json.get('brief', {}).get('essence', '')
+            or session_json.get('phase2_context', {}).get('essence', '')
+            or session_json.get('user_input', {}).get('brief', '')
+            or ''
+        )
         brand_values = session_json.get('brand_values', {})
         visual_palette = session_json.get('visual_palette', {})
 
@@ -382,170 +396,65 @@ class ArchitectAgent:
     # =========================================================================
 
     def _build_deterministic_topology(self, archetypes: List[Dict]) -> Dict:
-        """Build topology that includes every single archetype."""
+        """Build topology using DAG-first approach: classify roles, build DAG, layout.
+
+        Uses DAGLayout for deterministic position assignment from the DAG.
+        """
         n = len(archetypes)
 
         # Classify each archetype by role
-        inputs, processes, outputs, controls = [], [], [], []
+        sources, processes, outputs = [], [], []
         for i, arch in enumerate(archetypes):
             category = arch.get('category', 'effect')
             role = arch.get('role', CATEGORY_ROLE_MAP.get(category, 'process'))
             if role == 'input':
-                inputs.append(i)
+                sources.append(i)
             elif role == 'output':
                 outputs.append(i)
-            elif role in ('control', 'utility'):
-                controls.append(i)
             else:
                 processes.append(i)
 
-        # If no explicit outputs, promote last process node
         if not outputs and processes:
             outputs.append(processes.pop())
-        # If no explicit inputs, promote first process node
-        if not inputs and processes:
-            inputs.insert(0, processes.pop(0))
+        if not sources and processes:
+            sources.insert(0, processes.pop(0))
 
-        # Assign Z layers
-        # Z=0: inputs, Z=1: controls, Z=2..N-2: processes, Z=N-1: outputs
-        num_process_layers = max(1, min(len(processes), 4))
-        max_z = 1 + (1 if controls else 0) + num_process_layers + (1 if outputs else 0)
+        # Build DAG: sources -> process chain -> outputs
+        dag = []
+        if processes:
+            for src in sources:
+                dag.append({"from": src, "to": processes[0]})
+            for i in range(len(processes) - 1):
+                dag.append({"from": processes[i], "to": processes[i + 1]})
+            for out in outputs:
+                dag.append({"from": processes[-1], "to": out})
+        else:
+            for src in sources:
+                for out in outputs:
+                    dag.append({"from": src, "to": out})
 
-        nodes = []
-        z_cursor = 0
+        # Fill orphans
+        node_roles = {}
+        for i in sources:
+            node_roles[i] = "source"
+        for i in processes:
+            node_roles[i] = "process"
+        for i in outputs:
+            node_roles[i] = "output"
+        dag = DAGLayout.ensure_dag_complete(dag, n, node_roles)
 
-        # Input layer
-        for xi, idx in enumerate(inputs):
-            nodes.append({
-                'archetype_index': idx,
-                'grid_position': [xi, 0, z_cursor],
-                'grid_size': [1, 1],
-                'input_from': []
-            })
-        input_z = z_cursor
-        z_cursor += 1
+        # Convert DAG -> positions
+        layout = DAGLayout()
+        topology = layout.layout(dag, n)
 
-        # Control layer
-        ctrl_z = z_cursor
-        if controls:
-            for xi, idx in enumerate(controls):
-                # Controls take input from first input node
-                nodes.append({
-                    'archetype_index': idx,
-                    'grid_position': [xi, 1, z_cursor],
-                    'grid_size': [1, 1],
-                    'input_from': [inputs[0]] if inputs else []
-                })
-            z_cursor += 1
+        # Add grid_size to each node
+        for tn in topology.get("nodes", []):
+            if "grid_size" not in tn:
+                tn["grid_size"] = [1, 1]
 
-        # Process layers — spread processes across Z layers
-        # Engine-aware chaining: prefer connecting to same-engine predecessors
-        prev_layer_indices = inputs + controls
-        for pi, idx in enumerate(processes):
-            pz = z_cursor + (pi * num_process_layers // max(len(processes), 1))
-            px = pi % 4
-            py = pi // 4
-
-            my_cat = archetypes[idx].get('category', 'effect')
-            my_engine = infer_engine_from_category(my_cat)
-
-            if pi == 0:
-                # First process: pick compatible inputs from input/ctrl layer
-                compatible = [
-                    pidx for pidx in prev_layer_indices
-                    if _engines_compatible(
-                        infer_engine_from_category(archetypes[pidx].get('category', 'effect')),
-                        my_engine
-                    )
-                ]
-                inp_from = compatible[:2] if compatible else prev_layer_indices[:2]
-            else:
-                # Chain: prefer previous same-engine process, fall back to any
-                prev_idx = processes[pi - 1]
-                prev_engine = infer_engine_from_category(
-                    archetypes[prev_idx].get('category', 'effect'))
-                if _engines_compatible(prev_engine, my_engine):
-                    inp_from = [prev_idx]
-                else:
-                    # Search backwards for a compatible process node
-                    inp_from = []
-                    for back in range(pi - 1, -1, -1):
-                        b_idx = processes[back]
-                        b_engine = infer_engine_from_category(
-                            archetypes[b_idx].get('category', 'effect'))
-                        if _engines_compatible(b_engine, my_engine):
-                            inp_from = [b_idx]
-                            break
-                    if not inp_from:
-                        # No compatible process found, try inputs
-                        for iidx in prev_layer_indices:
-                            i_engine = infer_engine_from_category(
-                                archetypes[iidx].get('category', 'effect'))
-                            if _engines_compatible(i_engine, my_engine):
-                                inp_from = [iidx]
-                                break
-                    if not inp_from:
-                        inp_from = [processes[pi - 1]]  # absolute fallback
-
-            nodes.append({
-                'archetype_index': idx,
-                'grid_position': [px, py, pz],
-                'grid_size': [1, 1],
-                'input_from': inp_from
-            })
-        process_end_z = z_cursor + num_process_layers - 1
-        z_cursor = process_end_z + 1
-
-        # Output layer — engine-aware: connect to the LATEST compatible predecessors
-        # Search processes last-to-first, then controls, then inputs
-        for xi, idx in enumerate(outputs):
-            out_cat = archetypes[idx].get('category', 'output')
-            out_engine = infer_engine_from_category(out_cat)
-
-            compatible = []
-            # Search processes in reverse (last process = deepest in chain)
-            for pidx in reversed(processes):
-                p_cat = archetypes[pidx].get('category', 'effect')
-                p_engine = infer_engine_from_category(p_cat)
-                if _engines_compatible(p_engine, out_engine):
-                    compatible.append(pidx)
-                    if len(compatible) >= 2:
-                        break
-
-            # If not enough, try controls then inputs
-            if len(compatible) < 1:
-                for pidx in reversed(controls + inputs):
-                    p_cat = archetypes[pidx].get('category', 'effect')
-                    p_engine = infer_engine_from_category(p_cat)
-                    if _engines_compatible(p_engine, out_engine):
-                        compatible.append(pidx)
-                        if len(compatible) >= 2:
-                            break
-
-            if not compatible:
-                compatible = processes[-2:] if processes else inputs[-1:]
-
-            nodes.append({
-                'archetype_index': idx,
-                'grid_position': [xi, 0, z_cursor],
-                'grid_size': [1, 1],
-                'input_from': compatible
-            })
-        z_cursor += 1
-
-        assert len(nodes) == len(archetypes), \
-            f"Topology has {len(nodes)} nodes but {len(archetypes)} archetypes"
-
-        grid_x = max(4, len(inputs), len(processes) // 2 + 1)
-        grid_y = max(4, (len(processes) + 3) // 4 + 2)
-
-        return {
-            'grid_size': [grid_x, grid_y, z_cursor],
-            'nodes': nodes,
-            'reasoning': f'Deterministic placement: {len(inputs)} inputs, '
-                         f'{len(controls)} controls, {len(processes)} processes, '
-                         f'{len(outputs)} outputs across {z_cursor} Z-layers'
-        }
+        topology['reasoning'] = (f'Deterministic DAG: {len(sources)} sources, '
+                                 f'{len(processes)} processes, {len(outputs)} outputs')
+        return topology
 
     # =========================================================================
     # LLM Connection Refinement (optional, does NOT drop nodes)
@@ -580,18 +489,9 @@ Rules:
 Respond ONLY with a JSON array, no markdown."""
 
         try:
-            resp = requests.post(
-                OLLAMA_URL,
-                json={
-                    'model': self.model,
-                    'prompt': prompt,
-                    'stream': False,
-                    'options': {'temperature': 0.3, 'num_predict': 4096}
-                },
-                timeout=None  # No timeout for mason:latest
-            )
-            if resp.ok:
-                text = resp.json().get('response', '')
+            aider = get_aider_llm()
+            text = aider.call(prompt, self.model)
+            if text:
                 match = re.search(r'\[[\s\S]*\]', text)
                 if match:
                     conns = json.loads(match.group())
@@ -647,7 +547,7 @@ Respond ONLY with a JSON array, no markdown."""
                     if other['grid_position'][2] < my_z
                 ]
                 if candidates:
-                    nd['input_from'] = [candidates[-1]]
+                    nd['input_from'] = candidates[-4:]  # up to 4 lower-Z nodes
 
         return topology
 
@@ -697,10 +597,13 @@ Respond ONLY with a JSON array, no markdown."""
             category = arch.get('category', 'effect')
             # Pass keywords so the dynamic router can detect generative art intent
             keywords = arch.get('keywords', [])
-            engine = infer_engine_from_category(category, keywords=keywords)
-            hints = arch.get('engine_hints', {})
-            if hints.get('preferred_engine'):
-                engine = hints['preferred_engine']
+            # Explicit engine from archetype (set by SemanticReasoner/LLM) takes priority.
+            # Fall back to keyword-based inference, then GLSL as last resort.
+            engine = (
+                arch.get('engine')
+                or (arch.get('engine_hints') or {}).get('preferred_engine')
+                or infer_engine_from_category(category, keywords=keywords)
+            )
 
             modality = CATEGORY_MODALITY_MAP.get(category, 'texture')
             domain = CATEGORY_DOMAIN_MAP.get(category, 'visual')
@@ -774,6 +677,11 @@ Respond ONLY with a JSON array, no markdown."""
             else:
                 params = {}
 
+            # Semantic purpose from brief decomposition (JEPA-style)
+            semantic_map = topology.get("semantic_map", {})
+            sem_info = semantic_map.get(idx, {})
+            semantic_purpose = sem_info.get("purpose", "")
+
             nt = NodeTensor(
                 id=node_id,
                 meta=meta,
@@ -783,7 +691,8 @@ Respond ONLY with a JSON array, no markdown."""
                 code_snippet="",  # Mason fills this in
                 parameters=params,
                 input_nodes=input_ids,
-                output_texture=texture
+                output_texture=texture,
+                semantic_purpose=semantic_purpose,
             )
             node_tensors.append(nt)
 
@@ -995,6 +904,31 @@ Respond ONLY with a JSON array, no markdown."""
                     if inp_z > z:
                         log.append(f"WARN: {n.id} at Z={z} takes input from {inp_id} at Z={inp_z} (backwards)")
 
+        # Check for orphan non-source nodes (no inputs but not a source)
+        source_keywords = {"noise", "generator", "input", "sampler", "oscillator", "source", "loader", "field"}
+        for n in grid.nodes:
+            if n.input_nodes:
+                continue
+            cat = (getattr(n, 'category', '') or n.id or '').lower()
+            is_source = any(kw in cat for kw in source_keywords)
+            if not is_source:
+                log.append(f"WARN: Orphan node {n.id} has no inputs and is not a source")
+
+        # Check graph depth
+        all_z = [n.grid_position[2] if len(n.grid_position) > 2 else 0 for n in grid.nodes]
+        max_z = max(all_z) if all_z else 0
+        if max_z < 2 and len(grid.nodes) > 3:
+            log.append(f"WARN: Shallow graph (depth={max_z}), expected >= 2 for {len(grid.nodes)} nodes")
+
+        # Check output node placement
+        output_keywords = {"output", "composite", "final", "render", "display"}
+        for n in grid.nodes:
+            cat = (getattr(n, 'category', '') or n.id or '').lower()
+            is_output = any(kw in cat for kw in output_keywords)
+            z = n.grid_position[2] if len(n.grid_position) > 2 else 0
+            if is_output and z < max_z:
+                log.append(f"WARN: Output node {n.id} at Z={z} but maxZ={max_z} (should be at end)")
+
         if valid and not log:
             log.append("OK: Topology valid")
 
@@ -1036,6 +970,27 @@ Respond ONLY with a JSON array, no markdown."""
         for n in grid.nodes:
             d = depths.get(n.id, 0)
             n.grid_position = (n.grid_position[0], n.grid_position[1], d)
+
+        # Force output nodes to maxZ
+        output_keywords = {"output", "composite", "final", "render", "display"}
+        max_depth = max(depths.values()) if depths else 0
+        for n in grid.nodes:
+            cat = (getattr(n, 'category', '') or n.id or '').lower()
+            is_output = any(kw in cat for kw in output_keywords)
+            if is_output and depths.get(n.id, 0) < max_depth:
+                new_z = max_depth + 1
+                n.grid_position = (n.grid_position[0], n.grid_position[1], new_z)
+                depths[n.id] = new_z
+                # Ensure output has input from deepest non-output node
+                deepest_non_output = [
+                    nid for nid, d in depths.items()
+                    if d == max_depth and nid != n.id
+                    and not any(kw in (getattr(node_by_id.get(nid), 'category', '') or nid or '').lower()
+                                for kw in output_keywords)
+                ]
+                if deepest_non_output and not n.input_nodes:
+                    n.input_nodes = deepest_non_output[:2]
+                    print(f"  [REPAIR] Moved output {n.id} to Z={new_z}, connected from {n.input_nodes}")
 
         # Rebuild connections list from input_nodes
         grid.connections = []

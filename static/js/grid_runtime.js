@@ -18,8 +18,11 @@ class GridRuntime {
 
     this.nodes = []; // { id, z, engine, executor }
     this.inputMap = new Map(); // nodeId -> [inputNodeId,...]
+    this._nodeById = new Map(); // nodeId -> node (fast lookup)
+    this._nodesByZ = new Map(); // z -> [node,...] (fast per-layer lookup)
 
     this.running = false;
+    this._rendering = false; // guard: prevent concurrent _renderFrame calls
     this.lastTime = 0;
     this.frame = 0;
 
@@ -34,18 +37,98 @@ class GridRuntime {
     this.nodeSpecs = new Map(); // nodeId -> original spec for error context
     this.failedNodes = new Set(); // nodes that failed to init
 
+    // Callback fired after a successful hot-reload so the frontend can patch
+    // currentProject and persist the fix to disk. Set by the page after init.
+    // Signature: onNodeFixed(nodeId, fixedCode, fixedParameters)
+    this.onNodeFixed = null;
+
     // Register shader error callback for RuntimeInspector
     this.hub.onShaderError = (nodeId, errorLog) => {
       this._onShaderError(nodeId, errorLog);
     };
+
+    // ── Universal error capture ─────────────────────────────────────────────
+    // Intercept ALL console.error calls + uncaught errors/rejections.
+    // Any error that can be attributed to a node ID is forwarded to Mason for
+    // fixing — no hard-coded pattern filters; Mason decides how to fix.
+    const _origConsoleError = console.error.bind(console);
+    console.error = (...args) => {
+      _origConsoleError(...args);
+      if (!this.gl.isContextLost()) this._routeConsoleError(args);
+    };
+    const _windowErrHandler = (ev) => {
+      if (this.gl.isContextLost()) return;
+      const msg = ev.message
+        || ev.reason?.message
+        || String(ev.reason || ev.error || '');
+      if (msg) this._routeConsoleError([msg]);
+    };
+    window.addEventListener('error', _windowErrHandler);
+    window.addEventListener('unhandledrejection', _windowErrHandler);
+
+    // WebGL context loss/restore — pause render on loss, full reinit on restore
+    this._lastProjectJson = null; // stored by loadProject for restore
+    this._contextLostAt = 0;      // timestamp of last context loss (for cooldown)
+    canvas.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault(); // required to allow restore
+      console.warn('[GridRuntime] WebGL context lost — pausing render loop');
+      this.running = false;
+      this._rendering = false;
+      // Stamp the loss time so _onShaderError and hotReloadNode stay silent
+      // for the post-loss cooldown window — prevents Mason compile storm mid-crash.
+      this._contextLostAt = performance.now();
+      // Destroy executors NOW while context IS lost:
+      // - GL deletes are safe no-ops (context is gone, nothing to corrupt)
+      // - Non-GL cleanup runs correctly: stops webcam streams, ml5 detector loops,
+      //   p5 sketches — preventing stale async loops from triggering immediate re-loss
+      //   on the restored context.
+      for (const node of this.nodes) {
+        try { node.executor?.destroy?.(); } catch (_) {}
+      }
+      this.nodes = [];
+      this._nodeById = new Map();
+      this._nodesByZ = new Map();
+      console.warn('[GridRuntime] All executors destroyed on context loss (non-GL cleanup complete)');
+    }, false);
+
+    canvas.addEventListener('webglcontextrestored', async () => {
+      console.log('[GridRuntime] WebGL context restored — reinitialising');
+      try {
+        // nodes array is already empty (cleared in webglcontextlost handler).
+        // loadProject → clear() will find nothing to destroy, so no INVALID_OPERATION
+        // from stale GL objects of the previous session.
+        this.hub = new TextureHub(this.gl, canvas.width, canvas.height);
+        this.hub.onShaderError = (nodeId, errorLog) => { this._onShaderError(nodeId, errorLog); };
+        if (this._lastProjectJson) {
+          await this.loadProject(this._lastProjectJson);
+          this.start();
+        }
+      } catch (err) {
+        console.error('[GridRuntime] Failed to reinit after context restore:', err);
+      }
+    }, false);
   }
 
   _onShaderError(nodeId, errorLog) {
-    // Prevent infinite loops (dedup same error)
+    // Bail if context is lost — GL no-ops produce false compile failures.
+    if (this.gl.isContextLost()) return;
+    // Bail during post-loss cooldown (3 s) — GPU is still stabilising.
+    if (performance.now() - (this._contextLostAt || 0) < 3000) return;
+
+    // Hard cap: max 5 fix attempts per node before giving up
+    if (!this._fixAttempts) this._fixAttempts = {};
+    const attempts = this._fixAttempts[nodeId] || 0;
+    if (attempts >= 5) {
+      console.warn(`[GridRuntime] Max fix attempts (5) reached for ${nodeId}, giving up`);
+      return;
+    }
+    this._fixAttempts[nodeId] = attempts + 1;
+
+    // Prevent identical error dedup
     if (this.errorCache[nodeId] === errorLog) return;
     this.errorCache[nodeId] = errorLog;
 
-    console.error(`[GridRuntime] Shader error for ${nodeId}:`, errorLog);
+    console.error(`[GridRuntime] Shader error for ${nodeId} (attempt ${attempts + 1}/2):`, errorLog);
 
     // Report to Python RuntimeInspector
     const spec = this.nodeSpecs.get(nodeId);
@@ -74,6 +157,27 @@ class GridRuntime {
       }
     })
     .catch(e => console.warn('[GridRuntime] Error reporting failed:', e));
+  }
+
+  _routeConsoleError(args) {
+    // Build a single string from all logged args
+    const msg = args.map(a => {
+      if (typeof a === 'string') return a;
+      if (a instanceof Error) return a.message + (a.stack ? '\n' + a.stack : '');
+      try { return String(a); } catch (_) { return ''; }
+    }).join(' ');
+
+    // Match patterns like [JSModuleExecutor:node_6_n6] or [Canvas2DExecutor:node_3]
+    const m = msg.match(/\[\w*Executor[:\s]+(node_\d+_\w+)\]/);
+    if (!m) return;
+    const nodeId = m[1];
+    if (!this.nodeSpecs.has(nodeId)) return;
+
+    // Strip executor prefix to get a clean error message for Mason
+    const errorText = msg.replace(/\[[\w\s:]+\]\s*/g, '').trim();
+    if (!errorText) return;
+
+    this._onShaderError(nodeId, errorText);
   }
 
   _installPointerHandlers() {
@@ -111,7 +215,22 @@ class GridRuntime {
   }
 
   async loadProject(projectJson) {
+    this._lastProjectJson = projectJson; // saved for webglcontextrestored replay
+
+    // If the WebGL context is lost, all GL calls are no-ops returning null/false.
+    // Attempting to init executors on a lost context produces misleading errors
+    // (valid shaders appear to fail, null textures are returned, etc.) and can
+    // trigger spurious Mason auto-fix loops. Bail here — webglcontextrestored
+    // will replay the load automatically once the GPU recovers.
+    if (this.gl.isContextLost()) {
+      console.warn('[GridRuntime] loadProject deferred — WebGL context is lost, will replay on restore');
+      return;
+    }
+
     this.stop();
+    // Yield one microtask after stop() so any in-flight _renderFrame promise can settle
+    // before clear() destroys the GL objects it may be referencing.
+    await Promise.resolve();
     this.clear();
 
     // Reset error tracking
@@ -158,6 +277,12 @@ class GridRuntime {
         execSpec
       });
 
+      // Yield one macrotask between each node init. Shader compilation is
+      // synchronous on the GPU — back-to-back compiles for all nodes spike GPU
+      // time and can trigger Windows TDR. Yielding spreads the work over
+      // multiple event-loop ticks and lets the browser breathe between nodes.
+      await new Promise(r => setTimeout(r, 0));
+
       try {
         const executor = createExecutor(execSpec, this.hub);
         await executor.init();
@@ -169,6 +294,14 @@ class GridRuntime {
           executor,
         });
       } catch (e) {
+        // If context was lost mid-init, the error is an infrastructure failure,
+        // not a code bug. Don't report it to Mason or create a fallback executor
+        // (which would also fail). The webglcontextrestored handler will replay.
+        if (this.gl.isContextLost()) {
+          console.warn(`[GridRuntime] Node ${nodeSpec.id} init aborted — WebGL context lost`);
+          break;
+        }
+
         // Capture runtime error with full context
         const errorInfo = {
           node_id: nodeSpec.id,
@@ -182,33 +315,15 @@ class GridRuntime {
         };
         this.errors.push(errorInfo);
         this.failedNodes.add(nodeSpec.id);
-        console.error(`[GridRuntime] Node ${nodeSpec.id} failed to init:`, e.message);
-
-        // Create passthrough fallback so the node isn't a transparent hole
-        // Shows prev layer with red tint to indicate error
-        try {
-          const fallbackSpec = {
-            id: nodeSpec.id,
-            engine: 'glsl',
-            code_snippet: `void main() {
-              vec2 uv = v_uv;
-              vec4 prev = texture(u_input0, uv);
-              fragColor = vec4(mix(prev.rgb, vec3(0.8, 0.1, 0.1), 0.3), max(prev.a, 0.5));
-            }`,
-            parameters: {},
-            z_layer: z,
-            input_nodes: inputs,
-          };
-          const fallback = createExecutor(fallbackSpec, this.hub);
-          await fallback.init();
-          this.nodes.push({ id: nodeSpec.id, z, engine: 'glsl', executor: fallback });
-          console.warn(`[GridRuntime] Node ${nodeSpec.id}: using passthrough fallback (will auto-fix)`);
-        } catch (_) { /* truly broken, leave transparent */ }
+        console.error(`[GridRuntime] Node ${nodeSpec.id} failed to init — Mason will fix:`, e.message);
       }
     }
 
     // Sort nodes by z, then stable by insertion order
     this.nodes.sort((a, b) => a.z - b.z);
+
+    // Build fast-lookup caches (avoid O(N²) per-frame scans)
+    this._rebuildNodeCaches();
 
     // Pre-create composites for all layers up to maxZ for continuous propagation
     const maxZ = this.getMaxZ();
@@ -230,6 +345,15 @@ class GridRuntime {
     return maxZ;
   }
 
+  _rebuildNodeCaches() {
+    this._nodeById = new Map(this.nodes.map(n => [n.id, n]));
+    this._nodesByZ = new Map();
+    for (const n of this.nodes) {
+      if (!this._nodesByZ.has(n.z)) this._nodesByZ.set(n.z, []);
+      this._nodesByZ.get(n.z).push(n);
+    }
+  }
+
   start() {
     if (this.running) return;
     this.running = true;
@@ -244,18 +368,33 @@ class GridRuntime {
 
   clear() {
         console.log("[GridRuntime] Clearing project state...");
-        
-        // 1. Clear node runtimes
-        this.nodes = {};
-        this.connections = [];
 
-        // 2. THE FIX: Only create TextureHub if it doesn't exist
-        if (!this.textureHub) {
+        // Wait for any in-flight async _renderFrame to finish before touching GPU resources.
+        // _rendering is an async guard — force-clear it so the next frame check aborts cleanly.
+        // The rAF callback checks this.running (already set false by stop()) before proceeding.
+        this._rendering = false;
+
+        // Give the browser one microtask to let any awaiting _renderFrame promise settle
+        // before we start deleting GL objects it may still be referencing.
+        // (This is synchronous clear; async teardown would require a promise chain.)
+
+        // 1. Destroy executors first so they free GL resources before hub.clearAll()
+        if (Array.isArray(this.nodes)) {
+            for (const node of this.nodes) {
+                try { node.executor?.destroy?.(); } catch (_) {}
+            }
+        }
+        this.nodes = [];
+        this.connections = [];
+        this._nodeById = new Map();
+        this._nodesByZ = new Map();
+
+        // 2. Flush hub textures after executors are destroyed
+        if (!this.hub) {
             console.log("[GridRuntime] Initializing TextureHub...");
-            this.textureHub = new TextureHub(this.gl);
+            this.hub = new TextureHub(this.gl, this.canvas.width, this.canvas.height);
         } else {
-            // If it already exists, just flush the old textures!
-            this.textureHub.clearAll();
+            this.hub.clearAll();
         }
 
         // 3. Clear canvas visually
@@ -350,12 +489,30 @@ class GridRuntime {
     return nodeEntry.enabled !== false;
   }
 
+  getExecutorForNode(id) {
+    return this.nodes.find(n => n.id === id)?.executor ?? null;
+  }
+
+  // Returns all audio + tracking hub data keyed by nodeId — used to broadcast
+  // audio/tracking to ALL downstream nodes regardless of connection topology.
+  _buildGlobalData() {
+    const gd = {};
+    for (const n of this.nodes) {
+      const d = this.hub.getNodeData(n.id);
+      if (d && (d.type === 'audio' || d.trackingData)) gd[n.id] = d;
+    }
+    return gd;
+  }
+
   // =========================================================================
   // Runtime Error Reporting & Hot-Reload
   // =========================================================================
 
   async reportErrors() {
     if (this.errors.length === 0) return;
+    // Don't report to Mason while context is lost or in post-loss cooldown.
+    if (this.gl.isContextLost()) return;
+    if (performance.now() - (this._contextLostAt || 0) < 3000) return;
 
     try {
       const response = await fetch('/api/runtime-errors', {
@@ -417,6 +574,17 @@ class GridRuntime {
   }
 
   async hotReloadNode(nodeId, fixedCode, fixedParameters) {
+    // Bail if context is lost or in post-loss cooldown — compiling on a lost/
+    // unstable context produces spurious errors and can trigger re-loss.
+    if (this.gl.isContextLost()) {
+      console.warn(`[GridRuntime] hotReloadNode deferred — context is lost`);
+      return false;
+    }
+    if (performance.now() - (this._contextLostAt || 0) < 3000) {
+      console.warn(`[GridRuntime] hotReloadNode deferred — post-loss cooldown active`);
+      return false;
+    }
+
     // Hot-reload a node with fixed code/parameters
     const spec = this.nodeSpecs.get(nodeId);
     if (!spec) {
@@ -428,11 +596,13 @@ class GridRuntime {
     this.failedNodes.delete(nodeId);
     this.errors = this.errors.filter(e => e.node_id !== nodeId);
 
-    // Destroy old executor if it exists
+    // Destroy old executor and free its hub GPU resources before re-allocating.
+    // Without hub.dealloc() here, every hot-reload leaks one full-res texture.
     const existingIdx = this.nodes.findIndex(n => n.id === nodeId);
     if (existingIdx >= 0) {
-      this.nodes[existingIdx].executor.destroy?.();
+      try { this.nodes[existingIdx].executor.destroy?.(); } catch (_) {}
       this.nodes.splice(existingIdx, 1);
+      this.hub.dealloc(nodeId);
     }
 
     // Create new executor with fixed code/params
@@ -459,14 +629,167 @@ class GridRuntime {
         executor,
       });
 
-      // Re-sort
+      // Re-sort and rebuild caches
       this.nodes.sort((a, b) => a.z - b.z);
+      this._rebuildNodeCaches();
 
+      // Clear fix attempts counter on success
+      if (this._fixAttempts) delete this._fixAttempts[nodeId];
       console.log(`[GridRuntime] Hot-reloaded node ${nodeId}`);
+
+      // Notify frontend to patch currentProject and save to disk
+      if (typeof this.onNodeFixed === 'function') {
+        this.onNodeFixed(nodeId, newExecSpec.code_snippet, newExecSpec.parameters);
+      }
       return true;
     } catch (e) {
       console.error(`[GridRuntime] Hot-reload failed for ${nodeId}:`, e.message);
       this.failedNodes.add(nodeId);
+
+      // Re-queue the error with the latest (still-broken) code so Mason retries.
+      // Node stays absent from this.nodes (renders transparent) until a fix succeeds.
+      this.errors.push({
+        node_id: nodeId,
+        category: spec.category || 'unknown',
+        engine: spec.engine,
+        error_message: e.message,
+        code_snippet: newExecSpec.code_snippet,
+        parameters: newExecSpec.parameters,
+        input_nodes: inputs,
+        timestamp: new Date().toISOString()
+      });
+      // Fire another fix attempt — don't await so we don't block the render loop.
+      this.reportErrors().catch(() => {});
+
+      return false;
+    }
+  }
+
+  removeNode(nodeId) {
+    const idx = this.nodes.findIndex(n => n.id === nodeId);
+    if (idx < 0) return false;
+
+    const node = this.nodes[idx];
+    const z = node.z;
+
+    // Destroy executor (stops webcam streams, GL resources, etc.)
+    try { node.executor?.destroy?.(); } catch (_) {}
+    this.nodes.splice(idx, 1);
+
+    // Deallocate hub GPU resources
+    this.hub.dealloc(nodeId);
+
+    // Clean up inputMap
+    this.inputMap.delete(nodeId);
+    for (const [toId, fromIds] of this.inputMap.entries()) {
+      const filtered = fromIds.filter(id => id !== nodeId);
+      this.inputMap.set(toId, filtered);
+    }
+
+    // Clean up tracking state
+    this.nodeSpecs.delete(nodeId);
+    this.failedNodes.delete(nodeId);
+    this.errors = this.errors.filter(e => e.node_id !== nodeId);
+    if (this._fixAttempts) delete this._fixAttempts[nodeId];
+    delete this.errorCache[nodeId];
+
+    // Force re-composite affected Z layers so ghost frame is cleared
+    const maxZ = this.getMaxZ();
+    for (let zz = z; zz <= maxZ; zz++) {
+      this.hub.publishLayerComposite(zz);
+    }
+    this.hub.blitToCanvas(maxZ >= 0 ? maxZ : 0);
+
+    return true;
+  }
+
+  // =========================================================================
+  // Incremental Layout Update — NO executor destruction or creation.
+  // Use instead of loadProject when only Z-layer positions or connections
+  // change (moveNodeZ, handleDrop, setNodeInput).  Costs: a few blit ops to
+  // republish layer composites.  No shader compilation, no texture allocation.
+  // =========================================================================
+  refreshLayout(projectJson) {
+    if (!projectJson) return;
+    this._lastProjectJson = projectJson;
+
+    // 1. Rebuild inputMap from the updated connections array
+    this.inputMap = new Map();
+    for (const conn of (projectJson.connections || [])) {
+      const to = conn.to_node, from = conn.from_node;
+      if (!to || !from) continue;
+      if (!this.inputMap.has(to)) this.inputMap.set(to, []);
+      this.inputMap.get(to).push(from);
+    }
+
+    // 2. Update Z-layer for every node that exists in the runtime
+    for (const nodeSpec of (projectJson.nodes || [])) {
+      const z = (nodeSpec.grid_position && nodeSpec.grid_position[2]) || 0;
+      const entry = this._nodeById.get(nodeSpec.id);
+      if (!entry) continue;
+      entry.z = z;
+      if (entry.executor) entry.executor.zLayer = z;
+      const hubEntry = this.hub.nodeTextures.get(nodeSpec.id);
+      if (hubEntry) hubEntry.z_layer = z;
+    }
+
+    // 3. Re-sort and rebuild fast-lookup caches
+    this.nodes.sort((a, b) => a.z - b.z);
+    this._rebuildNodeCaches();
+
+    // 4. Re-publish all layer composites (cheap: a few blit operations)
+    if (!this.gl.isContextLost()) {
+      const maxZ = this.getMaxZ();
+      for (let z = 0; z <= maxZ; z++) this.hub.publishLayerComposite(z);
+      this.hub.blitToCanvas(maxZ >= 0 ? maxZ : 0);
+    }
+  }
+
+  // =========================================================================
+  // Add a single node to the running runtime without touching existing nodes.
+  // Use instead of loadProject when addPredefinedNode inserts one new node.
+  // =========================================================================
+  async addNode(nodeSpec) {
+    if (this.gl.isContextLost()) {
+      console.warn('[GridRuntime] addNode deferred — context is lost');
+      return false;
+    }
+
+    const z = (nodeSpec.grid_position && nodeSpec.grid_position[2]) || 0;
+    const inputs = this.inputMap.get(nodeSpec.id) || nodeSpec.input_nodes || [];
+
+    const execSpec = {
+      id: nodeSpec.id,
+      engine: nodeSpec.engine,
+      code_snippet: nodeSpec.code_snippet,
+      parameters: nodeSpec.parameters || {},
+      z_layer: z,
+      input_nodes: inputs,
+    };
+
+    this.nodeSpecs.set(nodeSpec.id, { ...nodeSpec, execSpec });
+
+    // Yield one macrotask so the browser can render before GL work starts
+    await new Promise(r => setTimeout(r, 0));
+
+    try {
+      const executor = createExecutor(execSpec, this.hub);
+      await executor.init();
+
+      this.nodes.push({ id: nodeSpec.id, z, engine: nodeSpec.engine, executor });
+      this.nodes.sort((a, b) => a.z - b.z);
+      this._rebuildNodeCaches();
+
+      if (!this.gl.isContextLost()) {
+        const maxZ = this.getMaxZ();
+        for (let zz = 0; zz <= maxZ; zz++) this.hub.publishLayerComposite(zz);
+      }
+
+      console.log(`[GridRuntime] addNode: ${nodeSpec.id} (${nodeSpec.engine}) at Z=${z}`);
+      return true;
+    } catch (e) {
+      console.error(`[GridRuntime] addNode failed for ${nodeSpec.id}:`, e.message);
+      this.failedNodes.add(nodeSpec.id);
       return false;
     }
   }
@@ -481,17 +804,26 @@ class GridRuntime {
 
   _tick = (ms) => {
     if (!this.running) return;
+    requestAnimationFrame(this._tick);
+
+    // Stop rendering on context loss — handlers will restart when context is restored
+    if (this.gl.isContextLost()) return;
 
     const time = ms * 0.001;
-    const dt = Math.max(0, time - this.lastTime);
+    const dt = time - this.lastTime;
+
+    // Cap pipeline at 30fps
+    if (dt < 0.033) return;
     this.lastTime = time;
 
-    // Never stop the render loop due to per-node errors
-    this._renderFrame(time, dt).catch((e) => {
-      console.error('[GridRuntime] render frame error (continuing):', e);
-    });
+    // Guard: skip frame if previous _renderFrame is still awaiting async nodes
+    // Without this, async nodes cause exponential frame pileup → <1fps
+    if (this._rendering) return;
+    this._rendering = true;
 
-    requestAnimationFrame(this._tick);
+    this._renderFrame(time, dt)
+      .catch(e => console.error('[GridRuntime] render frame error (continuing):', e))
+      .finally(() => { this._rendering = false; });
   };
 
   async _renderFrame(time, dt) {
@@ -508,12 +840,17 @@ class GridRuntime {
 
     // Execute layer by layer
     for (let z = 0; z <= maxZ; z++) {
-      const nodesAtZ = this.nodes.filter(n => n.z === z);
+      const nodesAtZ = this._nodesByZ.get(z) || [];
 
       for (const node of nodesAtZ) {
         // Skip disabled nodes
-        if (node.enabled === false) {
-          continue;
+        if (node.enabled === false) continue;
+
+        // Adaptive throttle: slow nodes run every Nth frame instead of being disabled
+        if (node._frameSkip > 1) {
+          node._frameSkipCounter = (node._frameSkipCounter || 0) + 1;
+          if (node._frameSkipCounter < node._frameSkip) continue;
+          node._frameSkipCounter = 0;
         }
 
         try {
@@ -526,7 +863,7 @@ class GridRuntime {
           // what it's receiving and can auto-convert
           const inputData = {};
           for (const inId of inputNodeIds) {
-            const srcNode = this.nodes.find(n => n.id === inId);
+            const srcNode = this._nodeById.get(inId);
             const srcEntry = this.hub.getNodeEntry(inId);
             const srcData = this.hub.getNodeData(inId);
             const srcSpec = this.nodeSpecs.get(inId);
@@ -546,11 +883,43 @@ class GridRuntime {
             ...frameData,
             node: { id: node.id, engine: node.engine, z },
             inputs: inputData,
+            globalData: this._buildGlobalData(),
           };
 
+          const t0 = performance.now();
           const maybe = node.executor.execute(textures, time, data);
           if (maybe && typeof maybe.then === 'function') {
             await maybe;
+          }
+          // Context may have been lost during async node execute — abort remaining frame.
+          if (this.gl.isContextLost()) return;
+          const elapsed = performance.now() - t0;
+
+          // Adaptive throttle: slow nodes run every Nth frame to stay alive.
+          // js_module (p5) nodes engage after 3 slow frames — no JIT/CDN startup spike
+          // to ignore, and they're consistently slow. GLSL/canvas2d keep the 10-frame
+          // window to avoid false-positives from one-time shader compilation spikes.
+          // Recovery: any frame under 50ms immediately drops skip by one step.
+          const slowGate = node.engine === 'js_module' ? 3 : 10;
+          if (elapsed > 50) {
+            node._slowFrames = (node._slowFrames || 0) + 1;
+            if (node._slowFrames >= slowGate) {
+              const prevSkip = node._frameSkip || 1;
+              const newSkip = elapsed > 150 ? 4 : 2;
+              if (newSkip !== prevSkip) {
+                node._frameSkip = newSkip;
+                node._frameSkipCounter = 0;
+                console.warn(`[GridRuntime] Throttling ${node.id} (${node.engine}): ${elapsed.toFixed(0)}ms → running every ${newSkip} frames`);
+              }
+            }
+          } else {
+            // Fast again — step skip down by one level each fast frame for smooth recovery
+            const cur = node._frameSkip || 1;
+            if (cur > 1) {
+              node._frameSkip = cur > 2 ? 2 : 1;
+              node._frameSkipCounter = 0;
+            }
+            node._slowFrames = Math.max(0, (node._slowFrames || 0) - 2);
           }
         } catch (e) {
           // Log once per node, don't kill the render loop
