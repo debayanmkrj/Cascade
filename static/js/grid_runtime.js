@@ -405,6 +405,22 @@ class GridRuntime {
   resize(width, height) {
     this.canvas.width = width;
     this.canvas.height = height;
+
+    // Resizing the canvas can trigger a WebGL context loss. Wait one frame for
+    // the browser to restore it before touching any GL resources.
+    if (this.gl.isContextLost()) {
+      const onRestored = () => {
+        this.canvas.removeEventListener('webglcontextrestored', onRestored);
+        this._finishResize(width, height);
+      };
+      this.canvas.addEventListener('webglcontextrestored', onRestored);
+      return;
+    }
+
+    this._finishResize(width, height);
+  }
+
+  _finishResize(width, height) {
     this.gl.viewport(0, 0, width, height);
 
     // Replace hub (simplest correct approach)

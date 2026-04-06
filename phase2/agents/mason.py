@@ -916,58 +916,74 @@ void main() {
 
 Follow the exact rules from the GLSL template.
 """,
-    "three_js": """You are a Three.js Creative Coder writing a code body for a Three.js node.
+    "three_js": """You are a Three.js Creative Coder writing a self-contained ES module for a Three.js node.
 
-EXECUTION CONTEXT:
-The runtime provides: THREE, scene, camera, params, inputs.
-You do NOT create a renderer, scene, or camera — they already exist.
-You add objects to `scene`, set up lighting, and return an update function.
+REQUIRED CONTRACT:
+export default function init(canvas, width, height, params) {
+    // canvas: HTMLCanvasElement you own
+    // Create your own renderer, scene, camera here
+    // Return a frame update function
 
-REQUIREMENTS:
-1. Add lights and 3D objects to the provided `scene`.
-2. Use the provided `camera` — do NOT create a new camera.
-3. RETURN an object with an `update(time, inputs)` method called every frame.
-4. Use `params.*` for all controllable values.
-5. Use `inputs.textures` to access upstream node textures as THREE.CanvasTexture.
+    import * as THREE from 'https://esm.sh/three@0.160.0';
 
-CODE TEMPLATE:
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setSize(width, height);
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+    camera.position.z = 5;
+
+    // ... your setup code ...
+
+    return (time, inputs) => {
+        // Called every frame. time = seconds since start.
+        renderer.render(scene, camera);
+    };
+}
+
+EXAMPLE — Rotating torus:
 ```javascript
-// THREE, scene, camera, params, inputs are provided — do NOT redeclare them
+import * as THREE from 'https://esm.sh/three@0.160.0';
 
-// Add lights
-scene.add(new THREE.DirectionalLight(0xffffff, 1));
-scene.add(new THREE.AmbientLight(0x404040));
+export default function init(canvas, width, height, params) {
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setSize(width, height);
 
-// Create geometry and material
-const geometry = new THREE.TorusGeometry(1.5, 0.5, 32, 64);
-const material = new THREE.MeshStandardMaterial({
-    color: params.color || 0x44aaff,
-    metalness: params.metalness || 0.8,
-    roughness: params.roughness || 0.2
-});
-const mesh = new THREE.Mesh(geometry, material);
-scene.add(mesh);
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+    camera.position.z = 5;
 
-// Return update function — called every frame
-return {
-    update(time, inputs) {
+    scene.add(new THREE.DirectionalLight(0xffffff, 1));
+    scene.add(new THREE.AmbientLight(0x404040));
+
+    const geometry = new THREE.TorusGeometry(1.5, 0.5, 32, 64);
+    const material = new THREE.MeshStandardMaterial({
+        color: params.color || 0x44aaff,
+        metalness: params.metalness || 0.8,
+        roughness: params.roughness || 0.2,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    scene.add(mesh);
+
+    return (time, inputs) => {
         mesh.rotation.x = time * 0.5;
         mesh.rotation.y = time * 0.7;
-    }
-};
+        renderer.render(scene, camera);
+    };
+}
 ```
 
 CRITICAL RULES:
-- NEVER create a WebGLRenderer, Scene, or PerspectiveCamera — they are provided.
-- NEVER use import, export, require() — write a plain code body only.
+- ALWAYS export default function init(canvas, width, height, params)
+- ALWAYS return a (time, inputs) => { ... } frame function
+- ALWAYS import THREE from 'https://esm.sh/three@0.160.0'
+- ALWAYS create your own WebGLRenderer, Scene, and PerspectiveCamera inside init()
 - NEVER use TextureLoader, fetch, or any external file path ('path/to/...', '.jpg', '.png').
 - ALL textures MUST be procedurally generated using CanvasTexture or DataTexture with math/noise.
 - For CanvasTexture: create an OffscreenCanvas(256, 256), draw on it, wrap in new THREE.CanvasTexture(offscreen).
 - NEVER use document.createElement — use new OffscreenCanvas(w, h) for any offscreen canvas needs.
-- NEVER redeclare THREE, scene, camera, or params — they are already in scope.
 - Use params.* for ALL magic numbers that should be controllable.
 
-OUTPUT ONLY THE JAVASCRIPT BODY (no imports, no exports, no function wrapper). No markdown fences.
+OUTPUT ONLY THE JAVASCRIPT ES MODULE. No markdown fences.
 """,
     "webaudio": """You are writing a function that will run inside a WebAudio node (no imports).
 
@@ -2096,6 +2112,18 @@ return (time, inputs) => { };"""
             node.code_snippet = final_code
             node.mason_approved = ok  # passthrough stays False — not a real pass
             node.validation_errors = last_errors
+
+            # Reconcile uniforms/params from generated code so the frontend
+            # always receives a populated parameters dict (same step as main pipeline)
+            if ok and final_code and not getattr(node, 'is_passthrough', False):
+                validator = get_uniform_validator()
+                validation_result = validator.validate_and_reconcile(
+                    final_code, node.parameters or {}, engine
+                )
+                if validation_result["needs_fix"]:
+                    node.parameters = validation_result["fixed_params"]
+                    print(f"  [MASON] {node.id} params reconciled: {list(validation_result['missing_params'])}")
+
             updated.append(node)
 
         return updated

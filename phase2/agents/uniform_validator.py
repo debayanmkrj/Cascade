@@ -199,7 +199,7 @@ class UniformValidator:
         # Extract uniforms based on engine
         if engine in ("glsl", "regl"):
             code_uniforms = self.extract_uniforms_from_glsl(code)
-        elif engine in ("three_js", "p5", "canvas2d", "events"):
+        elif engine in ("three_js", "p5", "p5js", "canvas2d", "events", "js_module"):
             code_uniforms = self.extract_params_from_js(code)
         else:
             # Unknown engine, skip validation

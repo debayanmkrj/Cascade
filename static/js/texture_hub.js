@@ -304,7 +304,9 @@ class TextureHub {
 
   _compileShader(type, source) {
     const gl = this.gl;
+    if (gl.isContextLost()) throw new Error('TextureHub: WebGL context is lost');
     const shader = gl.createShader(type);
+    if (!shader) throw new Error('TextureHub: createShader returned null (context may be lost)');
     gl.shaderSource(shader, source);
     gl.compileShader(shader);
     if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {

@@ -1991,9 +1991,13 @@
                 addChat('Generate a brief or load a project first.', 'assistant');
                 return;
             }
-            addChat('Thinking...', 'assistant');
+
+            // Show a live status indicator that we can update in-place
+            const statusEl = addChatLive('Working on it\u2026', 'assistant');
+
             try {
-                const res = await fetch('/api/chat', {
+                // Step 1 — start the task, get task_id immediately
+                const startRes = await fetch('/api/chat', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({
@@ -2003,33 +2007,80 @@
                         project: currentProject
                     })
                 });
-                const data = await res.json();
-                document.getElementById('chatMessages').lastChild.remove();
+                const startData = await startRes.json();
+
+                if (!startData.success) {
+                    statusEl.remove();
+                    addChat('Error: ' + (startData.error || 'Unknown error'), 'assistant');
+                    return;
+                }
+
+                const taskId = startData.task_id;
+                let dots = 0;
+                const dotLabels = ['\u2022', '\u2022\u2022', '\u2022\u2022\u2022'];
+
+                // Step 2 — poll until done
+                const data = await new Promise((resolve, reject) => {
+                    const interval = setInterval(async () => {
+                        try {
+                            dots = (dots + 1) % 3;
+                            statusEl.textContent = 'Working on it ' + dotLabels[dots];
+
+                            const pollRes = await fetch('/api/chat-result/' + taskId);
+                            const pollData = await pollRes.json();
+
+                            if (pollData.status === 'done' || pollData.status === 'not_found') {
+                                clearInterval(interval);
+                                resolve(pollData);
+                            }
+                            // status === 'processing' → keep polling
+                        } catch (e) {
+                            clearInterval(interval);
+                            reject(e);
+                        }
+                    }, 1000);
+                });
+
+                // Step 3 — apply result
+                statusEl.remove();
+
                 if (data.success) {
                     addChat(data.response, 'assistant');
-                    // If project was modified (new node, delete, palette, param change)
                     if (data.project) {
                         currentProject = data.project;
                         renderGridView(currentProject);
-                        scheduleProjectSave();  // persist copilot changes to output file
+                        // Re-render the detail panel so new parameters appear immediately
+                        if (selectedNodeId) selectGridNode(selectedNodeId);
+                        scheduleProjectSave();
                         if (gridRuntime) {
                             gridRuntime.loadProject(currentProject)
                                 .then(() => gridRuntime.start())
                                 .catch(e => console.warn('[chat] grid reload:', e));
                         }
                     }
-                    // If a pipeline re-run is needed (new node, concept change)
                     if (data.pipeline_needed) {
                         addChat('Running pipeline to generate code...', 'assistant');
                         await runPhase2();
                     }
                 } else {
-                    addChat('Error: ' + data.error, 'assistant');
+                    addChat('Error: ' + (data.error || 'Task failed'), 'assistant');
                 }
+
             } catch (e) {
-                document.getElementById('chatMessages').lastChild.remove();
+                statusEl.remove();
                 addChat('Error: ' + e.message, 'assistant');
             }
+        }
+
+        // Add a chat bubble that can be mutated in-place (returns the element)
+        function addChatLive(txt, role) {
+            const m = document.getElementById('chatMessages');
+            const d = document.createElement('div');
+            d.className = 'chat-msg ' + role;
+            d.textContent = txt;
+            m.appendChild(d);
+            m.scrollTop = m.scrollHeight;
+            return d;
         }
 
         function addChat(txt, role) {

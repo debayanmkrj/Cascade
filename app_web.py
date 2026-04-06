@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import traceback
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -38,6 +39,12 @@ from data_types import RawInputBundle, ImageRef
 # Lazy loading for heavy components
 _phase1_pipeline = None
 _visual_clusterer = None
+
+# ---------------------------------------------------------------------------
+# Copilot async task store
+# ---------------------------------------------------------------------------
+_copilot_tasks: Dict[str, Dict] = {}  # task_id → {status, result}
+_copilot_tasks_lock = threading.Lock()
 _image_searcher = None
 _design_copilot = None
 _phase2_pipeline = None
@@ -496,74 +503,132 @@ def _generate_visualization(node_brief, images: List) -> Dict:
 # API - Chat / Design Assistant
 # ============================================================================
 
+def _resolve_session_json(session_id: Optional[str], project: Optional[Dict]) -> Optional[Dict]:
+    """Load session JSON from disk, or reconstruct and persist from project if not found."""
+    session_json = None
+    if session_id:
+        sessions_dir = Path(__file__).parent / 'sessions'
+        for f in sorted(sessions_dir.glob('*.json'), reverse=True):
+            try:
+                sj = json.loads(f.read_text(encoding='utf-8'))
+                if sj.get('session_id') == session_id:
+                    session_json = sj
+                    break
+            except Exception:
+                pass
+
+    if not session_json and session_id and project:
+        session_json = _reconstruct_session_from_project(project, session_id)
+        sessions_dir = Path(__file__).parent / 'sessions'
+        ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        reconstructed_path = sessions_dir / f"{ts}_session_{session_id[:8]}.json"
+        try:
+            reconstructed_path.write_text(json.dumps(session_json, indent=2), encoding='utf-8')
+            print(f"[chat] Reconstructed session from project → {reconstructed_path.name}")
+        except Exception as e:
+            print(f"[chat] Could not save reconstructed session: {e}")
+
+    return session_json
+
+
+def _save_session_if_needed(session_id: Optional[str], result: Dict) -> None:
+    """Write updated session JSON back to disk when pipeline re-run is requested."""
+    if not (session_id and result.get('session_json') and result.get('pipeline_needed')):
+        return
+    sessions_dir = Path(__file__).parent / 'sessions'
+    for f in sorted(sessions_dir.glob('*.json'), reverse=True):
+        try:
+            sj = json.loads(f.read_text(encoding='utf-8'))
+            if sj.get('session_id') == session_id:
+                f.write_text(json.dumps(result['session_json'], indent=2), encoding='utf-8')
+                break
+        except Exception:
+            pass
+
+
+def _run_copilot_task(task_id: str, message: str, session_json: Optional[Dict],
+                      project: Optional[Dict], selected_node_id: Optional[str],
+                      session_id: Optional[str]) -> None:
+    """Background worker: runs the copilot and stores the result in _copilot_tasks."""
+    try:
+        copilot = get_design_copilot()
+        result = copilot.process(message, session_json, project, selected_node_id)
+        _save_session_if_needed(session_id, result)
+        payload = {
+            'status': 'done',
+            'success': True,
+            'response': result['response'],
+            'project': result.get('project'),
+            'pipeline_needed': result.get('pipeline_needed', False),
+        }
+    except Exception as e:
+        traceback.print_exc()
+        payload = {'status': 'done', 'success': False, 'error': str(e)}
+
+    with _copilot_tasks_lock:
+        _copilot_tasks[task_id] = payload
+
+
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """Design Assistant Copilot — natural language pipeline control via llama3.2 tool-calling"""
+    """Design Assistant Copilot — starts a background task and returns immediately.
+
+    The frontend should poll /api/chat-result/<task_id> until status == 'done'.
+    Returns: {task_id, status: 'processing', response: 'Working on it...'}
+    """
     try:
         data = request.json
         message = data.get('message', '')
         session_id = data.get('session_id')
         selected_node_id = data.get('selected_node_id')
-        project = data.get('project')  # current output JSON from frontend
+        project = data.get('project')
 
         if not message:
             return jsonify({'success': False, 'error': 'No message provided'})
 
-        # Load session JSON from disk by matching session_id UUID
-        session_json = None
-        if session_id:
-            sessions_dir = Path(__file__).parent / 'sessions'
-            for f in sorted(sessions_dir.glob('*.json'), reverse=True):
-                try:
-                    sj = json.loads(f.read_text(encoding='utf-8'))
-                    if sj.get('session_id') == session_id:
-                        session_json = sj
-                        break
-                except Exception:
-                    pass
+        session_json = _resolve_session_json(session_id, project)
 
-        # If session not on disk but project data is available — reconstruct and persist
-        # so Phase 2 can find it if update_visual_concept is later called.
-        if not session_json and session_id and project:
-            session_json = _reconstruct_session_from_project(project, session_id)
-            sessions_dir = Path(__file__).parent / 'sessions'
-            ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-            reconstructed_path = sessions_dir / f"{ts}_session_{session_id[:8]}.json"
-            try:
-                reconstructed_path.write_text(
-                    json.dumps(session_json, indent=2), encoding='utf-8'
-                )
-                print(f"[chat] Reconstructed session from project → {reconstructed_path.name}")
-            except Exception as e:
-                print(f"[chat] Could not save reconstructed session: {e}")
+        task_id = str(uuid.uuid4())
+        with _copilot_tasks_lock:
+            _copilot_tasks[task_id] = {'status': 'processing'}
 
-        copilot = get_design_copilot()
-        result = copilot.process(message, session_json, project, selected_node_id)
+        t = threading.Thread(
+            target=_run_copilot_task,
+            args=(task_id, message, session_json, project, selected_node_id, session_id),
+            daemon=True,
+        )
+        t.start()
 
-        # If session was modified and we know the file, save it back so Phase 2 picks it up
-        if session_json and result.get('session_json') and result.get('pipeline_needed'):
-            sessions_dir = Path(__file__).parent / 'sessions'
-            for f in sorted(sessions_dir.glob('*.json'), reverse=True):
-                try:
-                    sj = json.loads(f.read_text(encoding='utf-8'))
-                    if sj.get('session_id') == session_id:
-                        f.write_text(
-                            json.dumps(result['session_json'], indent=2),
-                            encoding='utf-8'
-                        )
-                        break
-                except Exception:
-                    pass
-
-        return jsonify({
-            'success': True,
-            'response': result['response'],
-            'project': result.get('project'),
-            'pipeline_needed': result.get('pipeline_needed', False),
-        })
+        return jsonify({'success': True, 'task_id': task_id, 'status': 'processing',
+                        'response': 'Working on it...'})
     except Exception as e:
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/chat-result/<task_id>', methods=['GET'])
+def chat_result(task_id: str):
+    """Poll for the result of a /api/chat task.
+
+    Returns:
+      {status: 'processing'} while still running.
+      {status: 'done', success, response, project, pipeline_needed} when complete.
+      {status: 'not_found'} if task_id is unknown.
+    """
+    with _copilot_tasks_lock:
+        task = _copilot_tasks.get(task_id)
+
+    if task is None:
+        return jsonify({'status': 'not_found'})
+
+    if task.get('status') == 'processing':
+        return jsonify({'status': 'processing'})
+
+    # Done — return result and clean up
+    with _copilot_tasks_lock:
+        _copilot_tasks.pop(task_id, None)
+
+    return jsonify(task)
 
 
 @app.route('/api/save-project', methods=['POST'])

@@ -28,8 +28,9 @@ litellm.suppress_debug_info = True
 litellm.set_verbose = False
 
 from config import (
-    OLLAMA_URL, MODEL_NAME_REASONING, MODEL_NAME_FALLBACK,
-    CLOUD_API_KEY, CLOUD_API_BASE, DEFAULT_LEVEL_WEIGHTS,
+    OLLAMA_URL, MODEL_NAME_FALLBACK,
+    USE_CLOUD_LLM, CLOUD_API_KEY, CLOUD_API_BASE,
+    EFFECTIVE_MODEL_REASONING, DEFAULT_LEVEL_WEIGHTS,
 )
 
 
@@ -50,8 +51,8 @@ class SemanticReasoner:
 
     def __init__(self, rag_library=None):
         self.ollama_url = OLLAMA_URL
-        self.cloud_mode = False  # Semantic reasoner always uses local Ollama
-        self.model = MODEL_NAME_REASONING
+        self.cloud_mode = USE_CLOUD_LLM
+        self.model = EFFECTIVE_MODEL_REASONING
         self.fallback_model = MODEL_NAME_FALLBACK
         self.max_retries = 3
         self.rag = rag_library
