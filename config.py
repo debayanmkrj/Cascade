@@ -18,14 +18,13 @@ MODEL_NAME_REVIEW = "llama3.2:latest"  # Aider supervisory review model
 
 # Cloud LLM Settings — set USE_CLOUD_LLM=1 in env to activate; set USE_CLOUD_LLM=0 to roll back
 USE_CLOUD_LLM = os.environ.get("USE_CLOUD_LLM", "0") == "1"
-CLOUD_API_KEY = "e4b285c8f7ab467db9ee7205b6388cdd.-1y2_xcnDPGA_x7W5EMpGu1B"
-CLOUD_API_BASE = os.environ.get("CLOUD_API_BASE", "https://ollama.com/v1")
+CLOUD_API_KEY = "" #add here
+CLOUD_API_BASE = os.environ.get("CLOUD_API_BASE", "https://api.ollama.com/v1")
 CLOUD_MODEL_CODING = "qwen3-coder:480b-cloud"      # Replaces MODEL_NAME_CODING in cloud mode
-CLOUD_MODEL_REASONING = "qwen3.5:cloud"       # Replaces MODEL_NAME_REASONING in cloud mode
+CLOUD_MODEL_REASONING = "deepseek-v3.2:cloud"       # Replaces MODEL_NAME_REASONING in cloud mode
 
 # Effective models — auto-select cloud or local based on USE_CLOUD_LLM flag
 EFFECTIVE_MODEL_CODING = CLOUD_MODEL_CODING if USE_CLOUD_LLM else MODEL_NAME_CODING
-EFFECTIVE_MODEL_REASONING = CLOUD_MODEL_REASONING if USE_CLOUD_LLM else MODEL_NAME_REASONING
 EFFECTIVE_MODEL_FALLBACK = MODEL_NAME_FALLBACK   # Always local — cloud fallback makes no sense if primary already failed
 EFFECTIVE_MODEL_REVIEW = CLOUD_MODEL_REASONING if USE_CLOUD_LLM else MODEL_NAME_REVIEW
 
