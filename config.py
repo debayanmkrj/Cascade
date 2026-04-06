@@ -18,7 +18,7 @@ MODEL_NAME_REVIEW = "llama3.2:latest"  # Aider supervisory review model
 
 # Cloud LLM Settings — set USE_CLOUD_LLM=1 in env to activate; set USE_CLOUD_LLM=0 to roll back
 USE_CLOUD_LLM = os.environ.get("USE_CLOUD_LLM", "0") == "1"
-CLOUD_API_KEY = "e4b285c8f7ab467db9ee7205b6388cdd.-1y2_xcnDPGA_x7W5EMpGu1B"
+CLOUD_API_KEY = "" #add here
 CLOUD_API_BASE = os.environ.get("CLOUD_API_BASE", "https://api.ollama.com/v1")
 CLOUD_MODEL_CODING = "qwen3-coder:480b-cloud"      # Replaces MODEL_NAME_CODING in cloud mode
 CLOUD_MODEL_REASONING = "deepseek-v3.2:cloud"       # Replaces MODEL_NAME_REASONING in cloud mode
