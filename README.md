@@ -2,7 +2,14 @@
 
 **Prompt-driven generation of executable visual node graphs in volumetric space via agentic chain-of-influence synthesis.**
 
-> Submitted to ACM UIST '26
+![Screenshot 2026-04-05 170044](https://github.com/user-attachments/assets/fde0562f-8b8d-4ad2-ad31-73d4b1d1e7d3)
+
+![Screenshot 2026-04-05 171033](https://github.com/user-attachments/assets/aea4c1e5-8a08-4835-98ca-361149b26169)
+
+
+![Screenshot 2026-04-05 174639](https://github.com/user-attachments/assets/59d037f0-f5cb-46ec-992d-0c131cc123d6)
+
+
 
 ---
 
@@ -69,17 +76,7 @@ The generated node graph runs live in the browser on a shared **WebGL2** context
 
 `GLSL` · `p5.js` · `Three.js` · `Canvas 2D` · `WebAudio` · `html_video` · `ml5.js`
 
----
 
-## Validation (384 runs · 4,510 nodes)
-
-| Metric | Value |
-|---|---|
-| Mason final node approval | **97.0%** |
-| Runs with perfect Mason pass | 84.4% |
-| Severe-failure runs | 0.8% |
-
----
 
 ## License
 
